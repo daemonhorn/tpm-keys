@@ -176,8 +176,18 @@ _tpm_report_secret() {
                 esac
                 ;;
             *)
+                # Only flag as a botched attempt when the part before the
+                # first '=' actually looks like an identifier (e.g. a
+                # missing-quotes typo); a legacy key with an incidental '='
+                # (base64 padding, etc.) should not trigger the warning.
                 case "$PAIR" in
-                    *'='*) INVALID_SEGMENTS=$((INVALID_SEGMENTS + 1)) ;;
+                    *'='*)
+                        CAND="${PAIR%%=*}"
+                        case "$CAND" in
+                            '' | *[!A-Za-z0-9_]* | [0-9]*) : ;;
+                            *) INVALID_SEGMENTS=$((INVALID_SEGMENTS + 1)) ;;
+                        esac
+                        ;;
                 esac
                 ;;
         esac
