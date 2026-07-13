@@ -3,7 +3,10 @@
 A single POSIX `sh` script (`tpm_setup.sh`) that seals your SSH key and API
 key/token secrets inside your machine's TPM 2.0, protected by one Master PIN,
 and wires up automatic (or on-demand) unlocking in new shells — for both
-**sh/bash** and **tcsh**.
+**sh/bash** and **tcsh**. A companion PowerShell script (`tpm_setup.ps1`)
+does the same thing on Windows 11, reading and writing the *same* TPM NV RAM
+indices on the *same* physical chip, so a dual-booted machine can seal a
+secret in one OS and unlock it in the other.
 
 Instead of your SSH private key and API keys sitting in plaintext on disk,
 they live encrypted in TPM NV RAM. A new terminal either prompts you for the
@@ -15,6 +18,7 @@ key into `ssh-agent` and the API key(s) into your environment.
 - Debian / Ubuntu (and derivatives)
 - RHEL / Rocky / AlmaLinux / CentOS
 - FreeBSD
+- Windows 11 (PowerShell 7+) — see [Windows 11 / PowerShell 7](#windows-11--powershell-7) below
 
 ## Prerequisites
 
@@ -159,3 +163,68 @@ Running `tpm_setup.sh` again is safe:
   drive before deleting it from disk. Sealing it in the TPM ties it to this
   specific machine's TPM — losing the machine or the TPM means losing the
   key unless you kept an offline backup.
+
+## Windows 11 / PowerShell 7
+
+`tpm_setup.ps1` is a PowerShell port for dual-boot machines: it targets the
+same TPM 2.0 chip as `tpm_setup.sh`, so a secret sealed on Linux/FreeBSD can
+be unlocked on Windows and vice versa.
+
+### Why it's implemented differently
+
+There's no official `tpm2-tools` build for Windows, so this doesn't shell
+out to it. Instead it talks to the TPM directly over Windows' own **TBS**
+(TPM Base Services, `tbs.dll`) using hand-built TPM2 command buffers — the
+same protocol `tpm2-tools` speaks, just implemented natively in PowerShell.
+One side effect: since it never shells out for TPM operations, the PIN never
+appears in another process's command-line arguments (unlike the `ps`-visible
+caveat above for `tpm2-tools` on Linux/FreeBSD).
+
+Reading a sealed secret only needs the NV index's own PIN. Defining or
+removing an index needs the TPM *owner hierarchy* auth, which Windows
+leaves empty by default — so no admin rights are required for any of this,
+including first-time setup.
+
+### Prerequisites
+
+- Windows 11 with PowerShell 7+ (`pwsh`), a TPM 2.0 device enabled in UEFI,
+  and the OpenSSH Client feature (`ssh-keygen`, `ssh-add`, and the
+  `ssh-agent` service — usually preinstalled; if not,
+  `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` from an
+  elevated PowerShell).
+- **Execution policy**: `tpm_setup.ps1` is unsigned, so your effective
+  `Get-ExecutionPolicy` can't be `AllSigned` or `Restricted`, or PowerShell
+  will refuse to run it at all. `RemoteSigned` (the common default) is
+  fine. If needed: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+  This also determines whether your PowerShell profile (and therefore the
+  automatic `unlock_tpm` hook) loads on new sessions at all — the script
+  checks this in Phase 1 and warns if your policy would block it.
+
+### Cross-OS key sharing
+
+TPM NV indices are computed from a numeric UID (`22020096 + UID*2` and
+`+1`), matching `tpm_setup.sh`'s own formula. Windows has no `id -u`
+equivalent, so Phase 2 asks for the UID `tpm_setup.sh` used on the
+Linux/FreeBSD side of the dual boot (run `id -u` there). Leave it blank to
+use a Windows-only index instead (won't be shared with the other OS).
+
+### Usage
+
+```powershell
+pwsh -File tpm_setup.ps1
+```
+
+It walks through the same five phases as `tpm_setup.sh` (prerequisites,
+configuration, SSH key setup, seeding the TPM, shell integration), and
+installs an `unlock_tpm` PowerShell function the same way — appended to
+your `$PROFILE`, idempotently replaced on re-run. If your profile ends in
+an Authenticode signature block (common under `AllSigned` policies), the
+hook is inserted *before* that block, since PowerShell refuses to parse
+anything after `# SIG # End signature block`; doing so invalidates the
+existing signature, so re-sign the profile afterwards if your policy
+requires it.
+
+The loaded SSH key is written briefly to a per-user-ACL'd temp file for
+`ssh-add` (Windows OpenSSH's `ssh-add` doesn't support reading a key from
+stdin the way `tpm2_nvread ... | ssh-add -` does on Linux/FreeBSD) and
+deleted immediately after.
