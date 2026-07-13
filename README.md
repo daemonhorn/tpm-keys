@@ -180,10 +180,16 @@ One side effect: since it never shells out for TPM operations, the PIN never
 appears in another process's command-line arguments (unlike the `ps`-visible
 caveat above for `tpm2-tools` on Linux/FreeBSD).
 
-Reading a sealed secret only needs the NV index's own PIN. Defining or
-removing an index needs the TPM *owner hierarchy* auth, which Windows
-leaves empty by default — so no admin rights are required for any of this,
-including first-time setup.
+Reading or writing a sealed secret only needs the NV index's own PIN, so
+`unlock_tpm` and day-to-day use never require admin rights. **First-time
+setup does**, though: defining or removing an NV index (Phase 4) uses the
+TPM *owner hierarchy*, and independent of that hierarchy's own auth value,
+Windows TBS enforces its own allow-list of TPM 2.0 command ordinals that's
+different for standard-user vs. administrator processes — `NV_DefineSpace`/
+`NV_UndefineSpace` are excluded from the standard-user list and are blocked
+by Windows itself (`TPM_E_COMMAND_BLOCKED`) before ever reaching the TPM.
+Run `tpm_setup.ps1` itself from an elevated PowerShell; nothing after that
+first run needs elevation.
 
 ### Prerequisites
 
@@ -192,6 +198,15 @@ including first-time setup.
   `ssh-agent` service — usually preinstalled; if not,
   `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` from an
   elevated PowerShell).
+- **Run `tpm_setup.ps1` itself from an elevated ("Run as administrator")
+  PowerShell 7 window.** Phase 4 (seeding the TPM) calls `NV_DefineSpace`/
+  `NV_UndefineSpace`, which Windows TBS blocks for non-admin processes
+  regardless of the TPM's own owner-hierarchy auth value (see
+  [Why it's implemented differently](#why-its-implemented-differently)).
+  The script checks for this in Phase 1 and exits immediately with
+  guidance if it isn't elevated, rather than after you've entered your
+  secrets and PIN. Elevation is only needed for this initial run —
+  `unlock_tpm` and everyday use never require it.
 - **Execution policy**: `tpm_setup.ps1` is unsigned, so your effective
   `Get-ExecutionPolicy` can't be `AllSigned` or `Restricted`, or PowerShell
   will refuse to run it at all. `RemoteSigned` (the common default) is

@@ -8,9 +8,14 @@ a secret in one OS and unlock it in the other.
 Talks to the TPM directly over Windows TBS (tbs.dll) using hand-built TPM2
 command buffers -- there is no official tpm2-tools build for Windows, so
 this avoids depending on one. No admin rights are required for NV
-read/write (they authorize with the index's own PIN); defining/removing an
-index authorizes with the TPM owner hierarchy, which Windows leaves with an
-empty auth value by default.
+read/write (they authorize with the index's own PIN, and Windows TBS allows
+those ordinals for standard-user processes). Defining/removing an index
+(Phase 4, one-time setup) DOES require admin rights: independent of the
+TPM's own owner-hierarchy auth value, Windows TBS enforces its own
+allow-list of TPM 2.0 command ordinals that differs for standard-user vs.
+administrator processes, and NV_DefineSpace/NV_UndefineSpace are excluded
+from the standard-user list. Run this script itself elevated; day-to-day
+use afterwards (unlock_tpm) does not need elevation.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -68,6 +73,13 @@ $script:TPM_RC_AUTH_FAIL = 0x08E
 $script:TPM_RC_BAD_AUTH  = 0x0A2
 $script:TPM_RC_LOCKOUT   = 0x921
 $script:TPM_RC_NV_LOCKED = 0x148
+# Not the TPM's own RC -- Windows TBS synthesizes this (as HRESULT 0x80280400,
+# TPM_E_COMMAND_BLOCKED) when it refuses to submit a command at all, before it
+# ever reaches the TPM. TPM 2.0 command dispatch on Windows uses a per-command
+# allow-list that differs between elevated and standard-user processes; owner-
+# hierarchy commands like NV_DefineSpace/NV_UndefineSpace are excluded from the
+# standard-user list regardless of the TPM's own owner-auth value.
+$script:TPM_RC_COMMAND_BLOCKED = 0x400
 
 class Tpm2Exception : System.Exception {
     [uint32]$RawCode
@@ -125,8 +137,9 @@ function Get-Tpm2RcDescription {
         }
     }
     switch ($low) {
-        $script:TPM_RC_LOCKOUT   { return "TPM_RC_LOCKOUT (TPM dictionary-attack lockout is active)" }
-        $script:TPM_RC_NV_LOCKED { return "TPM_RC_NV_LOCKED" }
+        $script:TPM_RC_LOCKOUT          { return "TPM_RC_LOCKOUT (TPM dictionary-attack lockout is active)" }
+        $script:TPM_RC_NV_LOCKED        { return "TPM_RC_NV_LOCKED" }
+        $script:TPM_RC_COMMAND_BLOCKED  { return "TPM_E_COMMAND_BLOCKED (Windows TBS refused to submit this command for a non-admin process)" }
         default { return ("TPM error 0x{0:X}" -f $low) }
     }
 }
@@ -310,32 +323,69 @@ Invoke-Expression $Tpm2RawSource
 
 function Test-Tpm2OwnerAuthHint {
     param($Exception)
-    if ($Exception -is [Tpm2Exception] -and
-        (($Exception.RawCode -band 0xFFF -band (-bnot 0xF00)) -in @(0x08E, 0x0A2))) {
+    if ($Exception -isnot [Tpm2Exception]) { return }
+    $low = $Exception.RawCode -band 0xFFF
+    if (($low -band (-bnot 0xF00)) -in @(0x08E, 0x0A2)) {
         Write-TpmLine "[TPM] Hint: this TPM's owner hierarchy has a non-empty auth value (common on managed/enterprise devices)."
         Write-TpmLine "      Defining or removing NV indices needs owner auth; reading an already-sealed secret does not, since that only needs the index's own PIN."
+    } elseif ($low -eq $script:TPM_RC_COMMAND_BLOCKED) {
+        Write-TpmLine "[TPM] Hint: Windows blocked this command before it reached the TPM (TPM_E_COMMAND_BLOCKED), NOT a TPM owner-auth failure."
+        Write-TpmLine "      Windows TBS enforces a separate allow-list of TPM 2.0 commands for standard-user vs. administrator processes;"
+        Write-TpmLine "      NV_DefineSpace/NV_UndefineSpace (used only here, in Phase 4) are excluded from the standard-user list."
+        Write-TpmLine "      Re-run this script from an elevated ('Run as administrator') PowerShell 7 window."
+        Write-TpmLine "      Reading/writing an already-defined index (unlock_tpm, Phase 4's own writes after this point) does not need elevation."
     }
 }
 
 # 1. TPM presence
-try {
-    $tpmInfo = Get-Tpm
-} catch {
-    Write-TpmLine "[TPM] ERROR: Get-Tpm failed ($_). Is this Windows 11 with the TPM feature available?"
-    exit 1
+# Get-Tpm (Win32_Tpm under the hood) needs an elevated process for a non-admin
+# caller -- but it doesn't throw or write to the error stream when it lacks
+# that, it just returns the plain string "Administrator privilege is required
+# to execute this command." in place of a TPM info object. A naive
+# `$tpmInfo.TpmPresent` check on that string silently evaluates to $null
+# (falsy), so this used to hard-fail every unelevated run with a misleading
+# "enable TPM in UEFI" message. Since this script is explicitly designed to
+# NOT require admin rights for NV read/write, only use Get-Tpm for the
+# informational banner when it actually returns a real info object, and let
+# the TBS probe below -- which works fine unelevated -- be the actual
+# presence/readiness gate.
+$tpmInfo = $null
+try { $tpmInfo = Get-Tpm } catch { $tpmInfo = $null }
+if ($tpmInfo -and ($tpmInfo.PSObject.Properties.Name -contains 'TpmPresent') -and ($null -ne $tpmInfo.TpmPresent)) {
+    if (-not $tpmInfo.TpmPresent -or -not $tpmInfo.TpmReady) {
+        Write-TpmLine "[TPM] ERROR: No ready TPM 2.0 device found (TpmPresent=$($tpmInfo.TpmPresent), TpmReady=$($tpmInfo.TpmReady))."
+        Write-TpmLine "Ensure TPM 2.0 (fTPM/Intel PTT/discrete) is enabled in UEFI."
+        exit 1
+    }
+    Write-TpmLine "TPM detected: $($tpmInfo.ManufacturerIdTxt), owned=$($tpmInfo.TpmOwned)."
+} else {
+    Write-TpmLine "[TPM] Note: Get-Tpm did not return TPM details (commonly needs an elevated PowerShell); continuing without it."
 }
-if (-not $tpmInfo.TpmPresent -or -not $tpmInfo.TpmReady) {
-    Write-TpmLine "[TPM] ERROR: No ready TPM 2.0 device found (TpmPresent=$($tpmInfo.TpmPresent), TpmReady=$($tpmInfo.TpmReady))."
-    Write-TpmLine "Ensure TPM 2.0 (fTPM/Intel PTT/discrete) is enabled in UEFI."
-    exit 1
-}
-Write-TpmLine "TPM detected: $($tpmInfo.ManufacturerIdTxt), owned=$($tpmInfo.TpmOwned)."
 
 try {
     $probeCtx = Connect-Tpm2
     Disconnect-Tpm2 -Context $probeCtx
+    Write-TpmLine "TPM detected via TBS (no admin rights required)."
 } catch {
     Write-TpmLine "[TPM] ERROR: Could not open a TBS session: $_"
+    Write-TpmLine "Ensure TPM 2.0 (fTPM/Intel PTT/discrete) is enabled in UEFI."
+    exit 1
+}
+
+# Windows TBS enforces its own allow-list of TPM 2.0 command ordinals, separate
+# from the TPM's owner-hierarchy auth, and that list differs for standard-user
+# vs. administrator processes. NV_DefineSpace/NV_UndefineSpace (Phase 4, this
+# script's whole purpose) are excluded from the standard-user list and fail
+# with TPM_E_COMMAND_BLOCKED (0x80280400) for a non-admin caller -- so check
+# elevation now rather than walking the user through API key / PIN / SSH key
+# entry only to hit a wall in Phase 4.
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-TpmLine "[TPM] ERROR: This script must be run from an elevated ('Run as administrator') PowerShell 7 window."
+    Write-TpmLine "      Windows TBS blocks TPM2_NV_DefineSpace/TPM2_NV_UndefineSpace (Phase 4, used to create the NV"
+    Write-TpmLine "      indices) for non-admin processes -- this is a Windows-driver-level command allow-list,"
+    Write-TpmLine "      separate from the TPM's own owner-hierarchy auth. Day-to-day use afterwards (unlock_tpm's"
+    Write-TpmLine "      NV_Read) does NOT need elevation."
     exit 1
 }
 
