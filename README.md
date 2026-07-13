@@ -189,7 +189,13 @@ different for standard-user vs. administrator processes — `NV_DefineSpace`/
 `NV_UndefineSpace` are excluded from the standard-user list and are blocked
 by Windows itself (`TPM_E_COMMAND_BLOCKED`) before ever reaching the TPM.
 Run `tpm_setup.ps1` itself from an elevated PowerShell; nothing after that
-first run needs elevation.
+first run needs elevation. If Windows' built-in `sudo` is enabled (Windows
+11 24H2+, `Settings > System > For developers > Enable sudo`), the script
+detects a non-elevated run in Phase 1 and self-relaunches through it
+automatically — you get a single UAC prompt and never have to close the
+window and reopen an admin one yourself. This happens *before* Phase 2 asks
+for anything, so you only enter your secrets/PIN once, inside the elevated
+relaunch.
 
 ### Prerequisites
 
@@ -198,15 +204,25 @@ first run needs elevation.
   `ssh-agent` service — usually preinstalled; if not,
   `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` from an
   elevated PowerShell).
-- **Run `tpm_setup.ps1` itself from an elevated ("Run as administrator")
-  PowerShell 7 window.** Phase 4 (seeding the TPM) calls `NV_DefineSpace`/
-  `NV_UndefineSpace`, which Windows TBS blocks for non-admin processes
-  regardless of the TPM's own owner-hierarchy auth value (see
-  [Why it's implemented differently](#why-its-implemented-differently)).
-  The script checks for this in Phase 1 and exits immediately with
-  guidance if it isn't elevated, rather than after you've entered your
-  secrets and PIN. Elevation is only needed for this initial run —
-  `unlock_tpm` and everyday use never require it.
+- **Admin rights for the first run.** Phase 4 (seeding the TPM) calls
+  `NV_DefineSpace`/`NV_UndefineSpace`, which Windows TBS blocks for
+  non-admin processes regardless of the TPM's own owner-hierarchy auth
+  value (see [Why it's implemented differently](#why-its-implemented-differently)).
+  The script checks for this in Phase 1, before any prompts, and handles it
+  one of two ways:
+  - If Windows' built-in `sudo` is available, it self-relaunches through
+    `sudo pwsh -File tpm_setup.ps1` automatically (see above) — just
+    approve the UAC prompt. **`sudo` mode matters**: if `sudo` is
+    configured with input disabled (`Settings > System > For developers >
+    Enable sudo`, "input disabled" option), the elevated relaunch can't
+    reach this script's interactive prompts (API key, PIN, etc.) — use
+    "New window" or "Inline" mode instead. Check your current mode with
+    `sudo config`.
+  - Otherwise, it exits with instructions to re-run from an elevated
+    ("Run as administrator") PowerShell 7 window yourself.
+
+  Either way, elevation is only needed for this initial run — `unlock_tpm`
+  and everyday use never require it.
 - **Execution policy**: `tpm_setup.ps1` is unsigned, so your effective
   `Get-ExecutionPolicy` can't be `AllSigned` or `Restricted`, or PowerShell
   will refuse to run it at all. `RemoteSigned` (the common default) is

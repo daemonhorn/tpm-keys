@@ -381,11 +381,34 @@ try {
 # entry only to hit a wall in Phase 4.
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Windows 11's built-in `sudo` (Settings > System > For developers > Enable
+    # sudo) can self-elevate us without the user having to close this window
+    # and manually open an admin one. This check runs before Phase 2 asks for
+    # any secrets, so relaunching here means the user only enters values once,
+    # inside the elevated child -- not a re-prompt after a failed attempt.
+    $sudoCmd = Get-Command sudo.exe -ErrorAction SilentlyContinue
+    if ($sudoCmd) {
+        Write-TpmLine "[TPM] Not elevated -- relaunching via 'sudo' for Phase 4 (NV_DefineSpace/NV_UndefineSpace need admin; see README)."
+        Write-TpmLine "      If a UAC prompt appears, approve it. If 'sudo' is configured with input disabled, this"
+        Write-TpmLine "      script's prompts (API key, PIN, etc.) won't be reachable -- switch to 'Enable sudo' with"
+        Write-TpmLine "      'New window' or 'Inline' in Settings > System > For developers instead."
+        $pwshPath = (Get-Process -Id $PID).Path
+        # -ExecutionPolicy Bypass is scoped to just this one relaunched process
+        # (not a persistent policy change): the elevated child is a fresh pwsh
+        # instance that does NOT inherit whatever execution-policy context this
+        # shell is running under, so without it, an unsigned script here would
+        # fail to load under a CurrentUser/LocalMachine policy of AllSigned or
+        # Restricted even though the current, non-elevated invocation succeeded.
+        & $sudoCmd.Source $pwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
+        exit $LASTEXITCODE
+    }
     Write-TpmLine "[TPM] ERROR: This script must be run from an elevated ('Run as administrator') PowerShell 7 window."
     Write-TpmLine "      Windows TBS blocks TPM2_NV_DefineSpace/TPM2_NV_UndefineSpace (Phase 4, used to create the NV"
     Write-TpmLine "      indices) for non-admin processes -- this is a Windows-driver-level command allow-list,"
     Write-TpmLine "      separate from the TPM's own owner-hierarchy auth. Day-to-day use afterwards (unlock_tpm's"
     Write-TpmLine "      NV_Read) does NOT need elevation."
+    Write-TpmLine "      Tip: enable Windows' built-in 'sudo' (Settings > System > For developers > Enable sudo) so"
+    Write-TpmLine "      this script can self-elevate automatically next time."
     exit 1
 }
 
