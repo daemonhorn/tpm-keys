@@ -160,12 +160,56 @@ if ! id -nG | grep -qw "$GROUP_NAME"; then
     exit 0
 fi
 
+# --- SSH-agent-derived PIN helpers (optional API Key unlock optimization,
+# see the "API Key Unlock Optimization" prompt in Phase 3 below) ---
+_tpm_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d' ' -f1
+    elif command -v sha256 >/dev/null 2>&1; then
+        sha256 -q
+    fi
+}
+
+# Derives a stable PIN from a deterministic ed25519 signature: ssh-keygen -Y
+# sign is deterministic per RFC 8032 (same key + message + namespace always
+# produces the same signature bytes), whether signed directly from a private
+# key file (setup time) or via an ssh-agent identity referenced by its public
+# key (unlock time) -- verified empirically, both paths yield identical
+# signature bytes. $1 is the key path (private key at setup, public key at
+# unlock time so ssh-keygen can fall back to querying ssh-agent for it).
+# Truncated to 32 hex chars (128 bits): a full sha256 digest is 64 bytes,
+# which some TPMs reject as an auth value ("Invalid index authorization").
+_tpm_derive_api_pin() {
+    KEY_PATH="$1"
+    [ -r "$KEY_PATH" ] || return 1
+    SIGN_DIR=$(mktemp -d) || return 1
+    printf '%s' "tpm-api-pin-v1:${USER}" > "$SIGN_DIR/challenge"
+    DERIVED=""
+    if ssh-keygen -Y sign -f "$KEY_PATH" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
+        DERIVED=$(_tpm_sha256 < "$SIGN_DIR/challenge.sig" 2>/dev/null | cut -c1-32)
+    fi
+    rm -rf "$SIGN_DIR"
+    [ -n "$DERIVED" ] || return 1
+    printf '%s' "$DERIVED"
+}
+
 # --- 2. Dynamic NV Index Allocation & User Choices ---
 USER_UID=$(id -u)
 API_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 )))
 SSH_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 + 1 )))
 API_NV_SIZE=1024
 SSH_NV_SIZE=1024
+
+# Remembers which PIN sealed the API Key NV index ("master" or "agent" -- see
+# the "API Key Unlock Optimization" prompt below) across re-runs where the
+# user keeps existing data (RESEED=0) and Phase 5 regenerates the shell
+# integration without re-asking. Defaults to "master" for installs from
+# before this feature existed.
+STATE_FILE="$HOME/.tpm_keys_state"
+API_AUTH_MODE="master"
+[ -f "$STATE_FILE" ] && . "$STATE_FILE"
 
 # Belt-and-suspenders check: even after the group-membership gate above, a
 # device open() can still fail (odd devfs/udev rule, a group whose name
@@ -374,6 +418,31 @@ if [ "$SSH_KEY_SIZE" -gt "$SSH_NV_SIZE" ]; then
     exit 1
 fi
 
+printf "\n%s\n" "--- API Key Unlock Optimization ---"
+printf "%s\n" "ssh-agent keeps your loaded SSH identity available across every new"
+printf "%s\n" "gnome-terminal / gnome-shell tab in a session (they all inherit the"
+printf "%s\n" "same SSH_AUTH_SOCK), but \$SECURE_API_KEY is just a shell variable,"
+printf "%s\n" "so it does NOT carry over -- each new tab still prompts you for the"
+printf "%s\n" "Master PIN just to reload the API key, even though the SSH identity"
+printf "%s\n" "is already unlocked."
+printf "%s\n" ""
+printf "%s\n" "Enabling this seals the API Key under a PIN *derived* from your SSH"
+printf "%s\n" "ed25519 key (a deterministic 'ssh-keygen -Y sign' challenge) instead"
+printf "%s\n" "of the Master PIN. Once your SSH identity is loaded into ssh-agent in"
+printf "%s\n" "any tab, every other tab can silently re-derive that same value and"
+printf "%s\n" "load \$SECURE_API_KEY with NO PIN prompt."
+printf "%s\n" ""
+printf "%s\n" "Security note: this makes ssh-agent access equivalent to knowing the"
+printf "%s\n" "API key's PIN -- anyone who can get your agent to sign on your behalf"
+printf "%s\n" "(e.g. SSH agent forwarding to a hostile host) can derive it too."
+printf "%s\n" "Requires OpenSSH >= 8.2 (ssh-keygen -Y sign)."
+printf "Enable SSH-agent-derived PIN for the API Key? (y/n) [default: n]: "
+read API_PIN_MODE_CHOICE
+case "$API_PIN_MODE_CHOICE" in
+    [Yy]*) API_AUTH_MODE="agent" ;;
+    *) API_AUTH_MODE="master" ;;
+esac
+
 # --- 4. Seeding the TPM ---
 printf "\n%s\n" "=== Phase 4: Seeding TPM NV RAM ==="
 
@@ -396,15 +465,29 @@ _tpm_confirm_overwrite "$SSH_NV_INDEX" "SSH Key"
 tpm2_nvundefine -C o "$API_NV_INDEX" >/dev/null 2>&1 || true
 tpm2_nvundefine -C o "$SSH_NV_INDEX" >/dev/null 2>&1 || true
 
+API_NV_AUTH="$MASTER_PIN"
+if [ "$API_AUTH_MODE" = "agent" ]; then
+    printf "%s\n" "[TPM] Deriving API Key PIN from your SSH key (you may be asked for its passphrase)..."
+    if DERIVED_API_PIN=$(_tpm_derive_api_pin "$SSH_KEY_PATH") && [ -n "$DERIVED_API_PIN" ]; then
+        API_NV_AUTH="$DERIVED_API_PIN"
+    else
+        printf "[TPM] WARNING: Could not derive a PIN from the SSH key (requires OpenSSH >= 8.2's 'ssh-keygen -Y sign'). Falling back to the Master PIN for the API Key.\n"
+        API_AUTH_MODE="master"
+    fi
+    unset DERIVED_API_PIN
+fi
+printf "API_AUTH_MODE=%s\n" "$API_AUTH_MODE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+
 printf "Writing API Key to TPM (%s)...\n" "$API_NV_INDEX"
-if ! tpm2_nvdefine -C o -s "$API_NV_SIZE" -a "authread|authwrite" -p "$MASTER_PIN" "$API_NV_INDEX"; then
+if ! tpm2_nvdefine -C o -s "$API_NV_SIZE" -a "authread|authwrite" -p "$API_NV_AUTH" "$API_NV_INDEX"; then
     printf "[TPM] ERROR: Failed to define the API Key NV index. Aborting.\n"
     exit 1
 fi
-if ! printf "%s" "$API_KEY_INPUT" | tpm2_nvwrite -C "$API_NV_INDEX" -P "$MASTER_PIN" -i - "$API_NV_INDEX"; then
+if ! printf "%s" "$API_KEY_INPUT" | tpm2_nvwrite -C "$API_NV_INDEX" -P "$API_NV_AUTH" -i - "$API_NV_INDEX"; then
     printf "[TPM] ERROR: Failed to write the API Key to the TPM. Aborting.\n"
     exit 1
 fi
+unset API_NV_AUTH
 
 printf "Writing SSH Key to TPM (%s)...\n" "$SSH_NV_INDEX"
 if ! tpm2_nvdefine -C o -s "$SSH_NV_SIZE" -a "authread|authwrite" -p "$MASTER_PIN" "$SSH_NV_INDEX"; then
@@ -429,6 +512,36 @@ printf "\n%s\n" "=== Phase 5: Integrating with Shells ==="
 # 1. SH/BASH Payload
 SHRC_SNIPPET='
 # --- TPM Secure Environment Setup (sh/bash) ---
+TPM_API_AUTH_MODE='"$API_AUTH_MODE"'
+TPM_SSH_PUB_PATH="'"$SSH_KEY_PATH"'.pub"
+
+# Only meaningful when TPM_API_AUTH_MODE=agent: derives the API Key'"'"'s TPM
+# auth PIN from a deterministic ed25519 signature instead of the Master PIN.
+# See _tpm_derive_api_pin in tpm_setup.sh for why this is safe/deterministic.
+_tpm_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d" " -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d" " -f1
+    elif command -v sha256 >/dev/null 2>&1; then
+        sha256 -q
+    fi
+}
+
+_tpm_derive_api_pin() {
+    KEY_PATH="$1"
+    [ -r "$KEY_PATH" ] || return 1
+    SIGN_DIR=$(mktemp -d) || return 1
+    printf "%s" "tpm-api-pin-v1:${USER}" > "$SIGN_DIR/challenge"
+    DERIVED=""
+    if ssh-keygen -Y sign -f "$KEY_PATH" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
+        DERIVED=$(_tpm_sha256 < "$SIGN_DIR/challenge.sig" 2>/dev/null | cut -c1-32)
+    fi
+    rm -rf "$SIGN_DIR"
+    [ -n "$DERIVED" ] || return 1
+    printf "%s" "$DERIVED"
+}
+
 _tpm_load_secret() {
     RAW="$1"
     FOUND_KV=0
@@ -484,6 +597,23 @@ unlock_tpm() {
         if [ -z "$SSH_AUTH_SOCK" ] || { [ -n "$SSH_AGENT_PID" ] && ! kill -0 "$SSH_AGENT_PID" 2>/dev/null; }; then
             eval "$(ssh-agent -s)" > /dev/null
         fi
+
+        # Fast path: the SSH identity is already resident in the agent (e.g.
+        # a second gnome-terminal tab in the same session) and only the API
+        # key is missing -- derive its PIN from the agent instead of
+        # re-prompting for the Master PIN.
+        if [ "$NEEDS_SSH" -eq 0 ] && [ "$NEEDS_API" -eq 1 ] && [ "$TPM_API_AUTH_MODE" = "agent" ]; then
+            if AGENT_PIN=$(_tpm_derive_api_pin "$TPM_SSH_PUB_PATH") && [ -n "$AGENT_PIN" ]; then
+                RAW_SECRET=$(tpm2_nvread -C '"$API_NV_INDEX"' -P "$AGENT_PIN" '"$API_NV_INDEX"' 2>/dev/null | env LC_ALL=C tr -d '\''\0'\'')
+                unset AGENT_PIN
+                if [ -n "$RAW_SECRET" ]; then
+                    _tpm_load_secret "$RAW_SECRET"
+                    return 0
+                fi
+                printf "%s\n" "[TPM] Warning: SSH-agent-derived PIN did not unlock the API key; falling back to manual PIN entry."
+            fi
+        fi
+
         printf "\n[TPM] Secured keys missing from environment.\nEnter Master TPM PIN: "
         trap '"'"'stty echo'"'"' INT TERM
         stty -echo; read USER_PIN; stty echo; printf "\n"
@@ -493,7 +623,14 @@ unlock_tpm() {
             tpm2_nvread -C '"$SSH_NV_INDEX"' -P "$USER_PIN" '"$SSH_NV_INDEX"' 2>/dev/null | ssh-add - || printf "%s\n" "[TPM] Error: Failed to load SSH key."
         fi
         if [ "$NEEDS_API" -eq 1 ]; then
-            RAW_SECRET=$(tpm2_nvread -C '"$API_NV_INDEX"' -P "$USER_PIN" '"$API_NV_INDEX"' 2>/dev/null | env LC_ALL=C tr -d '\''\0'\'')
+            API_PIN="$USER_PIN"
+            if [ "$TPM_API_AUTH_MODE" = "agent" ]; then
+                AGENT_PIN=$(_tpm_derive_api_pin "$TPM_SSH_PUB_PATH")
+                [ -n "$AGENT_PIN" ] && API_PIN="$AGENT_PIN"
+                unset AGENT_PIN
+            fi
+            RAW_SECRET=$(tpm2_nvread -C '"$API_NV_INDEX"' -P "$API_PIN" '"$API_NV_INDEX"' 2>/dev/null | env LC_ALL=C tr -d '\''\0'\'')
+            unset API_PIN
             if [ -n "$RAW_SECRET" ]; then
                 _tpm_load_secret "$RAW_SECRET"
             else
@@ -570,6 +707,31 @@ case "$MODE" in
         set +f
         [ "$FOUND_KV" -eq 0 ] && emit SECURE_API_KEY "$RAW"
         ;;
+    agentpin)
+        # Derives the API Key's TPM auth PIN from a deterministic ed25519
+        # signature (ssh-keygen -Y sign) instead of the Master PIN -- used
+        # only when the setup script's "SSH-agent-derived PIN" mode was
+        # enabled. $2 is the SSH public key path; a matching private key
+        # already resident in ssh-agent is used automatically if the key
+        # itself isn't readable on disk.
+        KEY_PATH="$2"
+        [ -r "$KEY_PATH" ] || exit 1
+        SIGN_DIR=$(mktemp -d) || exit 1
+        printf '%s' "tpm-api-pin-v1:${USER}" > "$SIGN_DIR/challenge"
+        DERIVED=""
+        if ssh-keygen -Y sign -f "$KEY_PATH" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
+            if command -v sha256sum >/dev/null 2>&1; then
+                DERIVED=$(sha256sum < "$SIGN_DIR/challenge.sig" | cut -d' ' -f1 | cut -c1-32)
+            elif command -v shasum >/dev/null 2>&1; then
+                DERIVED=$(shasum -a 256 < "$SIGN_DIR/challenge.sig" | cut -d' ' -f1 | cut -c1-32)
+            elif command -v sha256 >/dev/null 2>&1; then
+                DERIVED=$(sha256 -q < "$SIGN_DIR/challenge.sig" | cut -c1-32)
+            fi
+        fi
+        rm -rf "$SIGN_DIR"
+        [ -n "$DERIVED" ] || exit 1
+        printf '%s' "$DERIVED"
+        ;;
 esac
 EOF
 
@@ -586,34 +748,63 @@ if ( $status != 0 ) set needs_ssh = 1
 if (! $?SECURE_API_KEY) set needs_api = 1
 
 if ( $needs_ssh == 1 || $needs_api == 1 ) then
-    echo ""
-    echo "[TPM] Secured keys missing from environment."
-    echo -n "Enter Master TPM PIN: "
-    stty -echo
-    set USER_PIN = $<
-    stty echo
-    echo ""
+    set _tpm_api_loaded = 0
 
-    if ( $needs_ssh == 1 ) then
-        sh "$HOME/.tpm_unlock_helper.sh" ssh SSH_IDX "$USER_PIN" | ssh-add -
-        if ( $status != 0 ) echo "[TPM] Error: Failed to load SSH key."
-    endif
-    if ( $needs_api == 1 ) then
-        set TPM_ENV_FILE = `mktemp`
-        sh "$HOME/.tpm_unlock_helper.sh" api API_IDX "$USER_PIN" > "$TPM_ENV_FILE"
-        if ( -s "$TPM_ENV_FILE" ) then
-            source "$TPM_ENV_FILE"
-            echo "[TPM] Secrets loaded."
-        else
-            echo "[TPM] Error: Failed to load API secret."
+    # Fast path: SSH identity already resident in the agent, only the API
+    # key is missing -- derive its PIN from the agent silently, no prompt.
+    if ( $needs_ssh == 0 && $needs_api == 1 && "AUTHMODE" == "agent" ) then
+        set AGENT_PIN = `sh "$HOME/.tpm_unlock_helper.sh" agentpin "PUBPATH"`
+        if ( "$AGENT_PIN" != "" ) then
+            set TPM_ENV_FILE = `mktemp`
+            sh "$HOME/.tpm_unlock_helper.sh" api API_IDX "$AGENT_PIN" > "$TPM_ENV_FILE"
+            if ( -s "$TPM_ENV_FILE" ) then
+                source "$TPM_ENV_FILE"
+                echo "[TPM] Secrets loaded."
+                set _tpm_api_loaded = 1
+            endif
+            rm -f "$TPM_ENV_FILE"
         endif
-        rm -f "$TPM_ENV_FILE"
+        unset AGENT_PIN
     endif
+
+    if ( $_tpm_api_loaded == 0 ) then
+        echo ""
+        echo "[TPM] Secured keys missing from environment."
+        echo -n "Enter Master TPM PIN: "
+        stty -echo
+        set USER_PIN = $<
+        stty echo
+        echo ""
+
+        if ( $needs_ssh == 1 ) then
+            sh "$HOME/.tpm_unlock_helper.sh" ssh SSH_IDX "$USER_PIN" | ssh-add -
+            if ( $status != 0 ) echo "[TPM] Error: Failed to load SSH key."
+        endif
+        if ( $needs_api == 1 ) then
+            set API_PIN = "$USER_PIN"
+            if ( "AUTHMODE" == "agent" ) then
+                set AGENT_PIN = `sh "$HOME/.tpm_unlock_helper.sh" agentpin "PUBPATH"`
+                if ( "$AGENT_PIN" != "" ) set API_PIN = "$AGENT_PIN"
+                unset AGENT_PIN
+            endif
+            set TPM_ENV_FILE = `mktemp`
+            sh "$HOME/.tpm_unlock_helper.sh" api API_IDX "$API_PIN" > "$TPM_ENV_FILE"
+            if ( -s "$TPM_ENV_FILE" ) then
+                source "$TPM_ENV_FILE"
+                echo "[TPM] Secrets loaded."
+            else
+                echo "[TPM] Error: Failed to load API secret."
+            endif
+            rm -f "$TPM_ENV_FILE"
+            unset API_PIN
+        endif
+    endif
+    unset _tpm_api_loaded
 else
     echo "[TPM] All secure keys are already loaded."
 endif
 EOF
-sed -i.bak "s/SSH_IDX/$SSH_NV_INDEX/g; s/API_IDX/$API_NV_INDEX/g" "$HOME/.tpm_unlock.csh" && rm -f "$HOME/.tpm_unlock.csh.bak"
+sed -i.bak "s/SSH_IDX/$SSH_NV_INDEX/g; s/API_IDX/$API_NV_INDEX/g; s/AUTHMODE/$API_AUTH_MODE/g; s#PUBPATH#$SSH_KEY_PATH.pub#g" "$HOME/.tpm_unlock.csh" && rm -f "$HOME/.tpm_unlock.csh.bak"
 
 # 3. TCSH Injection Profile
 CSHRC_SNIPPET='

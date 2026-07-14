@@ -74,9 +74,12 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
 2. **Phase 2 — configuration**: prompts for the secret(s) to store and a
    Master PIN (entered twice, hidden, and validated non-empty).
 3. **Phase 3 — SSH key setup**: uses `~/.ssh/id_ed25519`, offering to
-   generate one with `ssh-keygen` if it doesn't exist.
+   generate one with `ssh-keygen` if it doesn't exist. Also asks whether to
+   enable the [API Key Unlock Optimization](#api-key-unlock-optimization-ssh-agent-derived-pin)
+   (SSH-agent-derived PIN), opt-in and off by default.
 4. **Phase 4 — seeding the TPM**: writes both secrets into TPM NV RAM,
-   authenticated by your Master PIN. If a secret is already stored at that
+   authenticated by your Master PIN (the API Key instead by the derived PIN,
+   if that optimization is enabled). If a secret is already stored at that
    NV index, you're asked to confirm before it's overwritten.
 5. **Phase 5 — shell integration**: installs an `unlock_tpm` function/alias
    into `~/.bashrc`, `~/.shrc`, and `~/.cshrc` (re-running the script
@@ -119,6 +122,44 @@ misread).
 - **[2] Manual**: new shells print a one-line hint; you run `unlock_tpm`
   yourself whenever you need the keys.
 
+### API Key Unlock Optimization (SSH-agent-derived PIN)
+
+`ssh-agent` keeps your loaded SSH identity available across every new
+gnome-terminal / gnome-shell tab in a session — they all inherit the same
+`SSH_AUTH_SOCK` — but `$SECURE_API_KEY` is just a shell variable, so it does
+**not** carry over. Without this feature, every new tab still prompts for
+the Master PIN just to reload the API key, even though the SSH identity is
+already unlocked.
+
+Phase 3 (after SSH key setup, only when seeding/re-seeding) offers to seal
+the API Key under a PIN *derived* from your SSH ed25519 key instead — a
+SHA-256 digest (truncated to 32 hex chars) of a fixed, deterministic
+`ssh-keygen -Y sign` challenge signed with that key. Ed25519 signatures are
+deterministic (RFC 8032): the same key, message, and namespace always
+produce the same signature bytes, whether signed straight from the private
+key file (at setup time) or via an already-loaded `ssh-agent` identity
+referenced by its public key (at unlock time) — both paths were verified to
+produce byte-identical output.
+
+The practical effect: once your SSH identity is loaded into `ssh-agent` in
+any tab, every other tab can silently re-derive that same PIN and load
+`$SECURE_API_KEY` with **no PIN prompt at all**. The very first tab in a
+session (where the SSH identity isn't in the agent yet) still needs one
+Master PIN entry — which loads the SSH key *and* the API key together, same
+as today.
+
+This is opt-in (default: disabled) and asked for by y/n prompt during
+seeding. It's remembered across re-runs that keep existing data (in
+`~/.tpm_keys_state`), so re-running the script doesn't force you to
+reconsider it.
+
+**Security note**: enabling this makes `ssh-agent` access equivalent to
+knowing the API key's PIN. Anyone who can get your agent to sign on your
+behalf (e.g. via SSH agent forwarding to a compromised host) can derive the
+same PIN and read the sealed API key. Requires OpenSSH ≥ 8.2 (`ssh-keygen -Y
+sign`); the script falls back to the Master PIN with a warning if signing
+fails.
+
 ### Unlocking (after setup)
 
 ```
@@ -150,6 +191,10 @@ Running `tpm_setup.sh` again is safe:
   destroyed silently.
 - The `unlock_tpm` blocks added to `~/.bashrc`/`~/.shrc`/`~/.cshrc` are
   replaced in place, not duplicated.
+- Whether the API Key is sealed under the Master PIN or an SSH-agent-derived
+  PIN is remembered in `~/.tpm_keys_state`, so re-running without
+  re-seeding (keeping existing data) regenerates the shell integration
+  scripts with the correct unlock method instead of re-asking.
 
 ## Security notes
 
