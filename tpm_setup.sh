@@ -172,22 +172,40 @@ _tpm_sha256() {
     fi
 }
 
-# Derives a stable PIN from a deterministic ed25519 signature: ssh-keygen -Y
-# sign is deterministic per RFC 8032 (same key + message + namespace always
-# produces the same signature bytes), whether signed directly from a private
-# key file (setup time) or via an ssh-agent identity referenced by its public
-# key (unlock time) -- verified empirically, both paths yield identical
-# signature bytes. $1 is the key path (private key at setup, public key at
-# unlock time so ssh-keygen can fall back to querying ssh-agent for it).
+# Derives a stable PIN from an ed25519 signature over a fixed challenge.
+# ssh-keygen -Y sign is deterministic per RFC 8032 for a *given signer*
+# (same key + message + namespace always produces the same signature bytes
+# from that signer again) -- but different ssh-agent implementations are NOT
+# guaranteed to agree with each other or with direct-file signing on the
+# same key+message: verified empirically that GNOME Keyring's ssh-agent
+# produces a genuinely different (though internally consistent) signature
+# than signing straight from the private key file. So this always prefers
+# whatever identity is already loaded in a running agent (ssh-add -L) and
+# only falls back to the raw key file if no agent has it loaded -- this
+# function is shared verbatim with the generated unlock scripts, so as long
+# as *some* agent already holds the identity at seeding time, setup and
+# every later unlock go through the same signer and agree. $1 is a fallback
+# private/public key path used only when no agent has the identity loaded.
 # Truncated to 32 hex chars (128 bits): a full sha256 digest is 64 bytes,
 # which some TPMs reject as an auth value ("Invalid index authorization").
 _tpm_derive_api_pin() {
-    KEY_PATH="$1"
-    [ -r "$KEY_PATH" ] || return 1
+    FALLBACK_KEY="$1"
     SIGN_DIR=$(mktemp -d) || return 1
+    SIGN_KEY=""
+    AGENT_PUB=$(ssh-add -L 2>/dev/null | grep "^ssh-ed25519 " | head -n 1)
+    if [ -n "$AGENT_PUB" ]; then
+        printf '%s\n' "$AGENT_PUB" > "$SIGN_DIR/id.pub"
+        SIGN_KEY="$SIGN_DIR/id.pub"
+    elif [ -r "$FALLBACK_KEY" ]; then
+        SIGN_KEY="$FALLBACK_KEY"
+    fi
+    if [ -z "$SIGN_KEY" ]; then
+        rm -rf "$SIGN_DIR"
+        return 1
+    fi
     printf '%s' "tpm-api-pin-v1:${USER}" > "$SIGN_DIR/challenge"
     DERIVED=""
-    if ssh-keygen -Y sign -f "$KEY_PATH" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
+    if ssh-keygen -Y sign -f "$SIGN_KEY" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
         DERIVED=$(_tpm_sha256 < "$SIGN_DIR/challenge.sig" 2>/dev/null | cut -c1-32)
     fi
     rm -rf "$SIGN_DIR"
@@ -443,6 +461,33 @@ case "$API_PIN_MODE_CHOICE" in
     *) API_AUTH_MODE="master" ;;
 esac
 
+# Different ssh-agent implementations can compute genuinely different
+# signatures for the same key+message (verified: GNOME Keyring's agent
+# disagrees with direct key-file signing) -- so make sure whatever agent is
+# actually available now is the one used to derive the seed PIN, since
+# that's what future unlocks will also go through.
+if [ "$API_AUTH_MODE" = "agent" ]; then
+    if [ -n "$SSH_AUTH_SOCK" ] && ! ssh-add -l 2>/dev/null | grep -q "ED25519"; then
+        printf "%s\n" "[TPM] Loading your SSH identity into the running agent first, so the"
+        printf "%s\n" "PIN is derived the same way future unlocks will compute it..."
+        ssh-add "$SSH_KEY_PATH" || printf "[TPM] WARNING: ssh-add failed; this seed will sign directly from the key file instead.\n"
+    elif [ -z "$SSH_AUTH_SOCK" ]; then
+        printf "\n%s\n" "[TPM] WARNING: no ssh-agent is currently running, so this PIN would be"
+        printf "%s\n" "derived by signing directly from the private key file. Different agent"
+        printf "%s\n" "implementations (e.g. GNOME Keyring, common on GNOME desktops) can"
+        printf "%s\n" "compute a DIFFERENT signature for the same key, which would make future"
+        printf "%s\n" "unlocks fail with no obvious cause. For reliable results, start your"
+        printf "%s\n" "normal login ssh-agent, run 'ssh-add $SSH_KEY_PATH', then re-run this"
+        printf "%s\n" "script."
+        printf "Continue anyway, signing directly from the key file? (y/n) [default: n]: "
+        read API_PIN_NOAGENT_CONFIRM
+        case "$API_PIN_NOAGENT_CONFIRM" in
+            [Yy]*) ;;
+            *) printf "[TPM] Falling back to the Master PIN for the API Key.\n"; API_AUTH_MODE="master" ;;
+        esac
+    fi
+fi
+
 # --- 4. Seeding the TPM ---
 printf "\n%s\n" "=== Phase 4: Seeding TPM NV RAM ==="
 
@@ -467,7 +512,7 @@ tpm2_nvundefine -C o "$SSH_NV_INDEX" >/dev/null 2>&1 || true
 
 API_NV_AUTH="$MASTER_PIN"
 if [ "$API_AUTH_MODE" = "agent" ]; then
-    printf "%s\n" "[TPM] Deriving API Key PIN from your SSH key (you may be asked for its passphrase)..."
+    printf "%s\n" "[TPM] Deriving API Key PIN from your SSH identity (you may be asked for its passphrase if no agent has it loaded)..."
     if DERIVED_API_PIN=$(_tpm_derive_api_pin "$SSH_KEY_PATH") && [ -n "$DERIVED_API_PIN" ]; then
         API_NV_AUTH="$DERIVED_API_PIN"
     else
