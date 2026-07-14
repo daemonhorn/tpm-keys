@@ -454,11 +454,11 @@ printf "%s\n" "Security note: this makes ssh-agent access equivalent to knowing 
 printf "%s\n" "API key's PIN -- anyone who can get your agent to sign on your behalf"
 printf "%s\n" "(e.g. SSH agent forwarding to a hostile host) can derive it too."
 printf "%s\n" "Requires OpenSSH >= 8.2 (ssh-keygen -Y sign)."
-printf "Enable SSH-agent-derived PIN for the API Key? (y/n) [default: n]: "
+printf "Enable SSH-agent-derived PIN for the API Key? (y/n) [default: y]: "
 read API_PIN_MODE_CHOICE
 case "$API_PIN_MODE_CHOICE" in
-    [Yy]*) API_AUTH_MODE="agent" ;;
-    *) API_AUTH_MODE="master" ;;
+    [Nn]*) API_AUTH_MODE="master" ;;
+    *) API_AUTH_MODE="agent" ;;
 esac
 
 # Different ssh-agent implementations can compute genuinely different

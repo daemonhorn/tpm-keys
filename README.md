@@ -76,7 +76,7 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
 3. **Phase 3 — SSH key setup**: uses `~/.ssh/id_ed25519`, offering to
    generate one with `ssh-keygen` if it doesn't exist. Also asks whether to
    enable the [API Key Unlock Optimization](#api-key-unlock-optimization-ssh-agent-derived-pin)
-   (SSH-agent-derived PIN), opt-in and off by default.
+   (SSH-agent-derived PIN), on by default (can be turned off).
 4. **Phase 4 — seeding the TPM**: writes both secrets into TPM NV RAM,
    authenticated by your Master PIN (the API Key instead by the derived PIN,
    if that optimization is enabled). If a secret is already stored at that
@@ -134,12 +134,19 @@ already unlocked.
 Phase 3 (after SSH key setup, only when seeding/re-seeding) offers to seal
 the API Key under a PIN *derived* from your SSH ed25519 key instead — a
 SHA-256 digest (truncated to 32 hex chars) of a fixed, deterministic
-`ssh-keygen -Y sign` challenge signed with that key. Ed25519 signatures are
-deterministic (RFC 8032): the same key, message, and namespace always
-produce the same signature bytes, whether signed straight from the private
-key file (at setup time) or via an already-loaded `ssh-agent` identity
-referenced by its public key (at unlock time) — both paths were verified to
-produce byte-identical output.
+`ssh-keygen -Y sign` challenge signed with that key. ed25519 signing is
+deterministic (RFC 8032) *for a given signer* — the same agent (or the same
+direct key-file signing) always reproduces the same signature for the same
+key/message/namespace — but different `ssh-agent` implementations are
+**not** guaranteed to agree with each other: verified on real hardware that
+GNOME Keyring's `ssh-agent` (the default, persistent agent on most GNOME
+desktops) computes a different signature than signing directly from the key
+file for the identical key and message. To avoid that mismatch, Phase 4
+always derives (and seals) the PIN using whatever agent already has the
+identity loaded at seeding time — proactively loading it into the running
+agent first if it isn't there yet — so setup and every later unlock go
+through the same signer. It only falls back to direct key-file signing (and
+warns you) if no agent is running at all when you seed.
 
 The practical effect: once your SSH identity is loaded into `ssh-agent` in
 any tab, every other tab can silently re-derive that same PIN and load
@@ -148,8 +155,9 @@ session (where the SSH identity isn't in the agent yet) still needs one
 Master PIN entry — which loads the SSH key *and* the API key together, same
 as today.
 
-This is opt-in (default: disabled) and asked for by y/n prompt during
-seeding. It's remembered across re-runs that keep existing data (in
+This is **on by default** (`y` on a bare Enter) and asked for by y/n prompt
+during seeding; answer `n` to keep the API Key under the Master PIN instead.
+It's remembered across re-runs that keep existing data (in
 `~/.tpm_keys_state`), so re-running the script doesn't force you to
 reconsider it.
 
