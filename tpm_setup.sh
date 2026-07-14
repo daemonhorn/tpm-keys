@@ -8,6 +8,13 @@ set -e
 # $USER isn't guaranteed to be set (containers, cron, some su contexts).
 USER="${USER:-$(id -un)}"
 
+# tpm2-tools' libtss2 backends log every TCTI probe attempt (device, swtpm,
+# mssim, ...) straight to stderr, which buries our own error messages under
+# a wall of "ERROR:tcti:..." noise. Silence it by default; an operator who
+# wants the raw logs back can still set TSS2_LOG before running this script.
+TSS2_LOG="${TSS2_LOG:-all+none}"
+export TSS2_LOG
+
 printf "%s\n" "=== Phase 1: OS Detection & Prerequisites ==="
 
 OS_NAME=$(uname -s)
@@ -130,11 +137,26 @@ fi
 [ "$OS_NAME" = "Linux" ] && [ ! -c "$TPM_DEV" ] && TPM_DEV="/dev/tpm0"
 
 # 3. Safe Group Creation & Assignment
+#
+# NOTE: "id -nG $USER" (with a username argument) reads group membership
+# straight out of the passwd/group database, NOT the live process's actual
+# supplementary groups. It would report the new group as active immediately
+# after usermod runs, even in a shell that hasn't picked it up yet -- letting
+# this check pass right before the TPM device open() fails with EACCES.
+# "id -nG" with no argument reports this process's real, live group list,
+# which is what actually determines whether we can open the TPM device.
 eval "$GROUP_CREATE"
-if ! id -nG "$USER" | grep -qw "$GROUP_NAME"; then
+if ! id -nG | grep -qw "$GROUP_NAME"; then
     printf "Adding user %s to %s group...\n" "$USER" "$GROUP_NAME"
     eval "$GROUP_CMD"
-    printf "\n%s\n" "[TPM] ACTION REQUIRED: Group membership changed. Log out completely and log back in, then re-run this script."
+    printf "\n%s\n" "================================================================"
+    printf "%s\n"   "[TPM] ACTION REQUIRED: Group membership changed."
+    printf "%s\n"   "================================================================"
+    printf "%s\n" "Log out COMPLETELY and log back in, then re-run this script from a"
+    printf "%s\n" "brand-new terminal. A partial logout (locking the screen, closing"
+    printf "%s\n" "one window, or reusing an existing tmux/screen session that"
+    printf "%s\n" "predates this change) will NOT pick up the new group -- you need a"
+    printf "%s\n" "fresh login session."
     exit 0
 fi
 
@@ -302,6 +324,31 @@ fi
 # --- 4. Seeding the TPM ---
 printf "\n%s\n" "=== Phase 4: Seeding TPM NV RAM ==="
 
+# Belt-and-suspenders check: even after the group-membership gate above, a
+# device open() can still fail (odd devfs/udev rule, a group whose name
+# matches but whose gid doesn't, running under su/sudo without a fresh
+# login shell, etc). Catch that here with a clear diagnostic instead of
+# letting tpm2_nvdefine fail and surface a confusing low-level error.
+if [ ! -r "$TPM_DEV" ] || [ ! -w "$TPM_DEV" ]; then
+    printf "\n%s\n" "================================================================"
+    printf "%s\n"   " ERROR: Cannot access the TPM device ($TPM_DEV)"
+    printf "%s\n"   "================================================================"
+    if id -nG | grep -qw "$GROUP_NAME"; then
+        printf "%s\n" "This shell IS in the '$GROUP_NAME' group, but still cannot"
+        printf "%s\n" "read/write $TPM_DEV. Check the device's owner/permissions:"
+        printf "%s\n" "  $(ls -l "$TPM_DEV" 2>/dev/null)"
+        printf "%s\n" "and confirm its group matches '$GROUP_NAME'."
+    else
+        printf "%s\n" "This shell is NOT in the '$GROUP_NAME' group, even though an"
+        printf "%s\n" "earlier run of this script should have added it. Log out"
+        printf "%s\n" "COMPLETELY (all terminals/tmux/screen sessions, full desktop"
+        printf "%s\n" "logout, not just a lock screen) and log back in, then re-run"
+        printf "%s\n" "this script from a brand-new terminal."
+    fi
+    printf "[TPM] ERROR: Aborting.\n"
+    exit 1
+fi
+
 _tpm_confirm_overwrite() {
     IDX="$1"
     LABEL="$2"
@@ -386,16 +433,27 @@ _tpm_load_secret() {
     fi
 }
 
-unlock_tpm() {
+# Read-only status check (no ssh-agent is started, no PIN is requested).
+# Sets NEEDS_SSH / NEEDS_API. Shared by unlock_tpm and the shell-startup
+# hint below, so the hint reflects the actual unlock state instead of
+# printing unconditionally.
+_tpm_needs_unlock() {
     NEEDS_SSH=0
     NEEDS_API=0
-    if [ -z "$SSH_AUTH_SOCK" ] || { [ -n "$SSH_AGENT_PID" ] && ! kill -0 "$SSH_AGENT_PID" 2>/dev/null; }; then
-        eval "$(ssh-agent -s)" > /dev/null
+    if [ -z "$SSH_AUTH_SOCK" ]; then
+        NEEDS_SSH=1
+    elif ! ssh-add -l 2>/dev/null | grep -q "ED25519"; then
+        NEEDS_SSH=1
     fi
-    if ! ssh-add -l 2>/dev/null | grep -q "ED25519"; then NEEDS_SSH=1; fi
-    if [ -z "$SECURE_API_KEY" ]; then NEEDS_API=1; fi
+    [ -z "$SECURE_API_KEY" ] && NEEDS_API=1
+}
 
+unlock_tpm() {
+    _tpm_needs_unlock
     if [ "$NEEDS_SSH" -eq 1 ] || [ "$NEEDS_API" -eq 1 ]; then
+        if [ -z "$SSH_AUTH_SOCK" ] || { [ -n "$SSH_AGENT_PID" ] && ! kill -0 "$SSH_AGENT_PID" 2>/dev/null; }; then
+            eval "$(ssh-agent -s)" > /dev/null
+        fi
         printf "\n[TPM] Secured keys missing from environment.\nEnter Master TPM PIN: "
         trap '"'"'stty echo'"'"' INT TERM
         stty -echo; read USER_PIN; stty echo; printf "\n"
@@ -420,7 +478,14 @@ unlock_tpm() {
 
 if [ "$STRATEGY_CHOICE" = "2" ]; then
     SHRC_SNIPPET="$SHRC_SNIPPET"'
-case "$-" in *i*) printf "\n%s\n" "[TPM] Hint: Run '\''unlock_tpm'\'' to load your secure keys." ;; esac'
+case "$-" in
+    *i*)
+        _tpm_needs_unlock
+        if [ "$NEEDS_SSH" -eq 1 ] || [ "$NEEDS_API" -eq 1 ]; then
+            printf "\n%s\n" "[TPM] Hint: Run '\''unlock_tpm'\'' to load your secure keys."
+        fi
+        ;;
+esac'
 else
     SHRC_SNIPPET="$SHRC_SNIPPET"'
 case "$-" in *i*) unlock_tpm ;; esac'
@@ -529,8 +594,19 @@ alias unlock_tpm "source ~/.tpm_unlock.csh"
 if [ "$STRATEGY_CHOICE" = "2" ]; then
     CSHRC_SNIPPET="$CSHRC_SNIPPET"'
 if ($?prompt) then
-    echo ""
-    echo "[TPM] Hint: Run '\''unlock_tpm'\'' to load your secure keys."
+    set _tpm_hint_needed = 0
+    if ($?SSH_AUTH_SOCK) then
+        sh -c '\''ssh-add -l 2>/dev/null'\'' | grep -q "ED25519"
+        if ( $status != 0 ) set _tpm_hint_needed = 1
+    else
+        set _tpm_hint_needed = 1
+    endif
+    if (! $?SECURE_API_KEY) set _tpm_hint_needed = 1
+    if ( $_tpm_hint_needed == 1 ) then
+        echo ""
+        echo "[TPM] Hint: Run '\''unlock_tpm'\'' to load your secure keys."
+    endif
+    unset _tpm_hint_needed
 endif'
 else
     CSHRC_SNIPPET="$CSHRC_SNIPPET"'
