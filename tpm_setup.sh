@@ -167,6 +167,67 @@ SSH_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 + 1 )))
 API_NV_SIZE=1024
 SSH_NV_SIZE=1024
 
+# Belt-and-suspenders check: even after the group-membership gate above, a
+# device open() can still fail (odd devfs/udev rule, a group whose name
+# matches but whose gid doesn't, running under su/sudo without a fresh
+# login shell, etc). Catch that here, before asking for any secrets, with a
+# clear diagnostic instead of letting a later tpm2 command fail and surface
+# a confusing low-level error.
+if [ ! -r "$TPM_DEV" ] || [ ! -w "$TPM_DEV" ]; then
+    printf "\n%s\n" "================================================================"
+    printf "%s\n"   " ERROR: Cannot access the TPM device ($TPM_DEV)"
+    printf "%s\n"   "================================================================"
+    if id -nG | grep -qw "$GROUP_NAME"; then
+        printf "%s\n" "This shell IS in the '$GROUP_NAME' group, but still cannot"
+        printf "%s\n" "read/write $TPM_DEV. Check the device's owner/permissions:"
+        printf "%s\n" "  $(ls -l "$TPM_DEV" 2>/dev/null)"
+        printf "%s\n" "and confirm its group matches '$GROUP_NAME'."
+    else
+        printf "%s\n" "This shell is NOT in the '$GROUP_NAME' group, even though an"
+        printf "%s\n" "earlier run of this script should have added it. Log out"
+        printf "%s\n" "COMPLETELY (all terminals/tmux/screen sessions, full desktop"
+        printf "%s\n" "logout, not just a lock screen) and log back in, then re-run"
+        printf "%s\n" "this script from a brand-new terminal."
+    fi
+    printf "[TPM] ERROR: Aborting.\n"
+    exit 1
+fi
+
+# --- Idempotency check: has this user already seeded TPM data? ---
+# Re-running this script (e.g. to pick up a shell-integration fix, or add
+# support for another shell) must not force new secrets to be entered and
+# the existing NV data destroyed -- that would break safe re-use.
+API_EXISTS=0
+SSH_EXISTS=0
+tpm2_nvreadpublic "$API_NV_INDEX" >/dev/null 2>&1 && API_EXISTS=1
+tpm2_nvreadpublic "$SSH_NV_INDEX" >/dev/null 2>&1 && SSH_EXISTS=1
+
+RESEED=1
+if [ "$API_EXISTS" -eq 1 ] && [ "$SSH_EXISTS" -eq 1 ]; then
+    printf "\n%s\n" "=== Existing TPM Data Detected ==="
+    printf "%s\n" "An API Key and SSH Key are already sealed in the TPM for this user"
+    printf "%s\n" "(NV indices $API_NV_INDEX / $SSH_NV_INDEX)."
+    printf "Re-seed and overwrite the existing data? (y/n) [default: n]: "
+    read RESEED_CHOICE
+    case "$RESEED_CHOICE" in
+        [Yy]*) RESEED=1 ;;
+        *) RESEED=0 ;;
+    esac
+fi
+
+printf "\n%s\n" "--- Unlock Strategy ---"
+printf "%s\n" "[1] Automatic : Prompt for PIN automatically when opening a new terminal."
+printf "%s\n" "[2] Manual    : Print a hint in new terminals, wait for you to run 'unlock_tpm'."
+printf "Choose (1 or 2) [default: 1]: "
+read STRATEGY_CHOICE
+[ "$STRATEGY_CHOICE" != "2" ] && STRATEGY_CHOICE="1"
+
+SSH_KEY_PATH="$HOME/.ssh/id_ed25519"
+
+if [ "$RESEED" -eq 0 ]; then
+    printf "\n%s\n" "[TPM] Keeping existing TPM data; skipping secret entry and re-seeding."
+else
+
 printf "\n%s\n" "=== Phase 2: Configuration ==="
 
 # --- Secret parsing helper, shared shape with the generated unlock scripts ---
@@ -289,16 +350,8 @@ while :; do
     fi
 done
 
-printf "%s\n" "--- Unlock Strategy ---"
-printf "%s\n" "[1] Automatic : Prompt for PIN automatically when opening a new terminal."
-printf "%s\n" "[2] Manual    : Print a hint in new terminals, wait for you to run 'unlock_tpm'."
-printf "Choose (1 or 2) [default: 1]: "
-read STRATEGY_CHOICE
-[ "$STRATEGY_CHOICE" != "2" ] && STRATEGY_CHOICE="1"
-
 # --- 3. SSH Key Generation ---
 printf "\n%s\n" "=== Phase 3: SSH Key Setup ==="
-SSH_KEY_PATH="$HOME/.ssh/id_ed25519"
 if [ ! -f "$SSH_KEY_PATH" ]; then
     printf "No Ed25519 key found at %s. Generate one now? (y/n): " "$SSH_KEY_PATH"
     read GEN_KEY
@@ -323,31 +376,6 @@ fi
 
 # --- 4. Seeding the TPM ---
 printf "\n%s\n" "=== Phase 4: Seeding TPM NV RAM ==="
-
-# Belt-and-suspenders check: even after the group-membership gate above, a
-# device open() can still fail (odd devfs/udev rule, a group whose name
-# matches but whose gid doesn't, running under su/sudo without a fresh
-# login shell, etc). Catch that here with a clear diagnostic instead of
-# letting tpm2_nvdefine fail and surface a confusing low-level error.
-if [ ! -r "$TPM_DEV" ] || [ ! -w "$TPM_DEV" ]; then
-    printf "\n%s\n" "================================================================"
-    printf "%s\n"   " ERROR: Cannot access the TPM device ($TPM_DEV)"
-    printf "%s\n"   "================================================================"
-    if id -nG | grep -qw "$GROUP_NAME"; then
-        printf "%s\n" "This shell IS in the '$GROUP_NAME' group, but still cannot"
-        printf "%s\n" "read/write $TPM_DEV. Check the device's owner/permissions:"
-        printf "%s\n" "  $(ls -l "$TPM_DEV" 2>/dev/null)"
-        printf "%s\n" "and confirm its group matches '$GROUP_NAME'."
-    else
-        printf "%s\n" "This shell is NOT in the '$GROUP_NAME' group, even though an"
-        printf "%s\n" "earlier run of this script should have added it. Log out"
-        printf "%s\n" "COMPLETELY (all terminals/tmux/screen sessions, full desktop"
-        printf "%s\n" "logout, not just a lock screen) and log back in, then re-run"
-        printf "%s\n" "this script from a brand-new terminal."
-    fi
-    printf "[TPM] ERROR: Aborting.\n"
-    exit 1
-fi
 
 _tpm_confirm_overwrite() {
     IDX="$1"
@@ -392,6 +420,8 @@ fi
 # which are briefly visible to other local users via `ps`. This is a known
 # limitation of the tpm2-tools CLI, not fixed here (the safer file-descriptor
 # input forms are tpm2-tools-version-dependent and unverified on this system).
+
+fi # RESEED
 
 # --- 5. Shell Integration ---
 printf "\n%s\n" "=== Phase 5: Integrating with Shells ==="
