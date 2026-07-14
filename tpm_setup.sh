@@ -529,12 +529,29 @@ _tpm_sha256() {
 }
 
 _tpm_derive_api_pin() {
-    KEY_PATH="$1"
-    [ -r "$KEY_PATH" ] || return 1
+    # $1 is a fallback public-key path, only used if the agent itself has
+    # nothing loaded -- the public key content normally comes straight from
+    # the agent (ssh-add -L) so this works even if the on-disk .pub file was
+    # deleted or never existed (only the private key half is required to be
+    # present at Phase 4 seeding time; nothing guarantees the .pub sticks
+    # around afterwards).
+    FALLBACK_KEY="$1"
     SIGN_DIR=$(mktemp -d) || return 1
+    SIGN_KEY=""
+    AGENT_PUB=$(ssh-add -L 2>/dev/null | grep "^ssh-ed25519 " | head -n 1)
+    if [ -n "$AGENT_PUB" ]; then
+        printf "%s\n" "$AGENT_PUB" > "$SIGN_DIR/id.pub"
+        SIGN_KEY="$SIGN_DIR/id.pub"
+    elif [ -r "$FALLBACK_KEY" ]; then
+        SIGN_KEY="$FALLBACK_KEY"
+    fi
+    if [ -z "$SIGN_KEY" ]; then
+        rm -rf "$SIGN_DIR"
+        return 1
+    fi
     printf "%s" "tpm-api-pin-v1:${USER}" > "$SIGN_DIR/challenge"
     DERIVED=""
-    if ssh-keygen -Y sign -f "$KEY_PATH" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
+    if ssh-keygen -Y sign -f "$SIGN_KEY" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
         DERIVED=$(_tpm_sha256 < "$SIGN_DIR/challenge.sig" 2>/dev/null | cut -c1-32)
     fi
     rm -rf "$SIGN_DIR"
@@ -711,15 +728,27 @@ case "$MODE" in
         # Derives the API Key's TPM auth PIN from a deterministic ed25519
         # signature (ssh-keygen -Y sign) instead of the Master PIN -- used
         # only when the setup script's "SSH-agent-derived PIN" mode was
-        # enabled. $2 is the SSH public key path; a matching private key
-        # already resident in ssh-agent is used automatically if the key
-        # itself isn't readable on disk.
-        KEY_PATH="$2"
-        [ -r "$KEY_PATH" ] || exit 1
+        # enabled. The public key content is read straight from the agent
+        # (ssh-add -L) so this works even if the on-disk .pub file was
+        # deleted or never existed; $2 is only a fallback path used if the
+        # agent has nothing loaded.
+        FALLBACK_KEY="$2"
         SIGN_DIR=$(mktemp -d) || exit 1
+        SIGN_KEY=""
+        AGENT_PUB=$(ssh-add -L 2>/dev/null | grep "^ssh-ed25519 " | head -n 1)
+        if [ -n "$AGENT_PUB" ]; then
+            printf '%s\n' "$AGENT_PUB" > "$SIGN_DIR/id.pub"
+            SIGN_KEY="$SIGN_DIR/id.pub"
+        elif [ -r "$FALLBACK_KEY" ]; then
+            SIGN_KEY="$FALLBACK_KEY"
+        fi
+        if [ -z "$SIGN_KEY" ]; then
+            rm -rf "$SIGN_DIR"
+            exit 1
+        fi
         printf '%s' "tpm-api-pin-v1:${USER}" > "$SIGN_DIR/challenge"
         DERIVED=""
-        if ssh-keygen -Y sign -f "$KEY_PATH" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
+        if ssh-keygen -Y sign -f "$SIGN_KEY" -n tpm-api-pin "$SIGN_DIR/challenge" >/dev/null 2>&1; then
             if command -v sha256sum >/dev/null 2>&1; then
                 DERIVED=$(sha256sum < "$SIGN_DIR/challenge.sig" | cut -d' ' -f1 | cut -c1-32)
             elif command -v shasum >/dev/null 2>&1; then
