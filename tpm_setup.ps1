@@ -317,6 +317,77 @@ function Read-Tpm2Nv {
     }
     ,$out
 }
+
+# Derives a stable API-key PIN from a deterministic ed25519 signature
+# (ssh-keygen -Y sign) over a fixed challenge, instead of the Master PIN.
+# Always prefers whatever identity is already loaded in ssh-agent -- setup-
+# time seeding and every later unlock (which only ever sees the agent's
+# copy) then go through the identical signer and agree.
+# $FallbackKeyPath is only used when the agent has nothing loaded yet (a
+# private key path at seed time, the matching .pub path in the generated
+# unlock_tpm, mirroring tpm_setup.sh). Different ssh-agent implementations
+# (this Windows service vs. GNOME Keyring vs. direct file signing) are not
+# guaranteed to agree with each other on the same key+message, so a PIN
+# derived here only unlocks from this same Windows ssh-agent -- it is not
+# portable to tpm_setup.sh on Linux/FreeBSD.
+function Get-TpmDerivedApiPin {
+    param([Parameter(Mandatory)][string]$FallbackKeyPath)
+    $signDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tpm_pin_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $signDir | Out-Null
+    try {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $signKey = $null
+        $agentPub = (& ssh-add -L 2>$null) | Where-Object { $_ -like 'ssh-ed25519 *' } | Select-Object -First 1
+        if ($agentPub) {
+            $signKey = Join-Path $signDir "id.pub"
+            [System.IO.File]::WriteAllText($signKey, "$agentPub`n", $utf8NoBom)
+        } elseif (Test-Path $FallbackKeyPath) {
+            $signKey = $FallbackKeyPath
+        }
+        if (-not $signKey) { return $null }
+
+        $challengeFile = Join-Path $signDir "challenge"
+        [System.IO.File]::WriteAllText($challengeFile, "tpm-api-pin-v1:$env:USERNAME", $utf8NoBom)
+
+        & ssh-keygen -Y sign -f $signKey -n tpm-api-pin $challengeFile 2>$null 1>$null
+        $sigFile = "$challengeFile.sig"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $sigFile)) { return $null }
+
+        # Hash the raw .sig bytes (not text) and truncate to 32 hex chars
+        # (128 bits) -- a full sha256 digest is 64 chars, which some TPMs
+        # reject as an auth value ("Invalid index authorization").
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $sha256.ComputeHash([System.IO.File]::ReadAllBytes($sigFile))
+        } finally {
+            $sha256.Dispose()
+        }
+        return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLowerInvariant().Substring(0, 32)
+    } finally {
+        Remove-Item -Recurse -Force $signDir -ErrorAction SilentlyContinue
+    }
+}
+
+# Parses the raw NV payload the same way at every call site (setup's own
+# scope and the generated unlock_tpm function): NAME="VALUE" segments
+# separated by ';', or the whole string as a single legacy opaque API key
+# if none match.
+function Set-TpmSecretFromRaw {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Raw)
+    $foundKv = $false
+    foreach ($seg in ($Raw -split ';')) {
+        if ([string]::IsNullOrEmpty($seg)) { continue }
+        if ($seg -match '^(?<name>[A-Za-z_][A-Za-z0-9_]*)="(?<value>.*)"$') {
+            [Environment]::SetEnvironmentVariable($Matches['name'], $Matches['value'], 'Process')
+            Write-Host "[TPM] Loaded env var: $($Matches['name'])"
+            $foundKv = $true
+        }
+    }
+    if (-not $foundKv) {
+        $env:SECURE_API_KEY = $Raw
+        if ($Raw) { Write-Host "[TPM] API Key loaded." }
+    }
+}
 '@
 
 Invoke-Expression $Tpm2RawSource
@@ -584,7 +655,61 @@ if ($sshKeyBytes.Length -gt $SshNvSize) {
     exit 1
 }
 
+Write-TpmLine "`n--- API Key Unlock Optimization ---"
+Write-TpmLine "The Windows OpenSSH ssh-agent service keeps your loaded SSH identity"
+Write-TpmLine "available across every new PowerShell window in this Windows session,"
+Write-TpmLine "but `$env:SECURE_API_KEY is just a process-scoped variable, so it does"
+Write-TpmLine "NOT carry over -- each new window still prompts you for the Master PIN"
+Write-TpmLine "just to reload the API key, even though the SSH identity is already"
+Write-TpmLine "unlocked."
+Write-TpmLine ""
+Write-TpmLine "Enabling this seals the API Key under a PIN *derived* from your SSH"
+Write-TpmLine "ed25519 key (a deterministic 'ssh-keygen -Y sign' challenge) instead"
+Write-TpmLine "of the Master PIN. Once your SSH identity is loaded into ssh-agent in"
+Write-TpmLine "any window, every other window can silently re-derive that same value"
+Write-TpmLine "and load `$env:SECURE_API_KEY with NO PIN prompt."
+Write-TpmLine ""
+Write-TpmLine "Security note: this makes ssh-agent access equivalent to knowing the"
+Write-TpmLine "API key's PIN -- anyone who can get your agent to sign on your behalf"
+Write-TpmLine "can derive it too. Requires OpenSSH >= 8.2 (ssh-keygen -Y sign)."
+Write-TpmLine ""
+Write-TpmLine "NOTE: the derived PIN is specific to this Windows ssh-agent -- different"
+Write-TpmLine "ssh-agent implementations are not guaranteed to compute the same signature"
+Write-TpmLine "for the same key, so an API Key sealed in agent mode here will only unlock"
+Write-TpmLine "on this Windows machine, not from tpm_setup.sh on Linux/FreeBSD. Keep this"
+Write-TpmLine "at the Master PIN if you need the API Key to unlock cross-OS."
+$apiPinChoice = Read-Host "Enable SSH-agent-derived PIN for the API Key? (y/n) [default: y]"
+if ($apiPinChoice -match '^[Nn]') { $apiAuthMode = 'master' } else { $apiAuthMode = 'agent' }
+
+if ($apiAuthMode -eq 'agent') {
+    # Make sure whatever agent is actually available now is the one used to
+    # derive the seed PIN, since that's what future unlocks will also go
+    # through (see Get-TpmDerivedApiPin).
+    $identities = & ssh-add -l 2>$null
+    if (-not (($identities -join "`n") -match 'ED25519')) {
+        Write-TpmLine "[TPM] Loading your SSH identity into the running agent first, so the"
+        Write-TpmLine "PIN is derived the same way future unlocks will compute it..."
+        & ssh-add $sshKeyPath
+        if ($LASTEXITCODE -ne 0) {
+            Write-TpmLine "[TPM] WARNING: ssh-add failed; this seed will sign directly from the key file instead."
+        }
+    }
+}
+
 Write-TpmLine "`n=== Phase 4: Seeding TPM NV RAM ==="
+
+$apiNvAuth = $masterPin
+if ($apiAuthMode -eq 'agent') {
+    Write-TpmLine "[TPM] Deriving API Key PIN from your SSH identity (you may be asked for its passphrase if no agent has it loaded)..."
+    $derivedApiPin = Get-TpmDerivedApiPin -FallbackKeyPath $sshKeyPath
+    if ($derivedApiPin) {
+        $apiNvAuth = $derivedApiPin
+    } else {
+        Write-TpmLine "[TPM] WARNING: Could not derive a PIN from the SSH key (requires OpenSSH >= 8.2's 'ssh-keygen -Y sign'). Falling back to the Master PIN for the API Key."
+        $apiAuthMode = 'master'
+        $apiNvAuth = $masterPin
+    }
+}
 $ctx = Connect-Tpm2
 try {
     foreach ($pair in @(@{ Idx = $ApiNvIndex; Label = "API Key" }, @{ Idx = $SshNvIndex; Label = "SSH Key" })) {
@@ -601,8 +726,8 @@ try {
         try { Remove-Tpm2NvIndex -Context $ctx -NvIndex $SshNvIndex } catch { }
 
         Write-TpmLine "Writing API Key to TPM (0x$($ApiNvIndex.ToString('X')))..."
-        New-Tpm2NvIndex -Context $ctx -NvIndex $ApiNvIndex -Size $ApiNvSize -Pin $masterPin
-        Write-Tpm2Nv -Context $ctx -NvIndex $ApiNvIndex -Data ([System.Text.Encoding]::UTF8.GetBytes($apiKeyInput)) -Pin $masterPin
+        New-Tpm2NvIndex -Context $ctx -NvIndex $ApiNvIndex -Size $ApiNvSize -Pin $apiNvAuth
+        Write-Tpm2Nv -Context $ctx -NvIndex $ApiNvIndex -Data ([System.Text.Encoding]::UTF8.GetBytes($apiKeyInput)) -Pin $apiNvAuth
 
         Write-TpmLine "Writing SSH Key to TPM (0x$($SshNvIndex.ToString('X')))..."
         New-Tpm2NvIndex -Context $ctx -NvIndex $SshNvIndex -Size $SshNvSize -Pin $masterPin
@@ -646,6 +771,32 @@ function unlock_tpm {
         Get-Content '$TpmHelperFile' -Raw | Invoke-Expression
     }
 
+    # Fast path: the SSH identity is already resident in the agent (e.g. a
+    # second PowerShell window in this session) and only the API key is
+    # missing -- derive its PIN from the agent instead of prompting for the
+    # Master PIN.
+    if (-not `$needsSsh -and `$needsApi -and ('$apiAuthMode' -eq 'agent')) {
+        `$agentPin = Get-TpmDerivedApiPin -FallbackKeyPath '$sshKeyPath.pub'
+        if (`$agentPin) {
+            `$apiLoaded = `$false
+            `$fastCtx = Connect-Tpm2
+            try {
+                try {
+                    `$rawBytes = Read-Tpm2Nv -Context `$fastCtx -NvIndex $ApiNvIndex -Pin `$agentPin
+                    `$raw = [System.Text.Encoding]::UTF8.GetString(`$rawBytes).TrimEnd([char]0)
+                    if (`$raw) {
+                        Set-TpmSecretFromRaw -Raw `$raw
+                        `$apiLoaded = `$true
+                    }
+                } catch { }
+            } finally {
+                Disconnect-Tpm2 -Context `$fastCtx
+            }
+            if (`$apiLoaded) { return }
+            Write-Host "[TPM] Warning: SSH-agent-derived PIN did not unlock the API key; falling back to manual PIN entry."
+        }
+    }
+
     Write-Host ""
     Write-Host "[TPM] Secured keys missing from environment."
     `$secure = Read-Host "Enter Master TPM PIN" -AsSecureString
@@ -668,21 +819,14 @@ function unlock_tpm {
         }
         if (`$needsApi) {
             try {
-                `$rawBytes = Read-Tpm2Nv -Context `$ctx -NvIndex $ApiNvIndex -Pin `$pin
+                `$apiPin = `$pin
+                if ('$apiAuthMode' -eq 'agent') {
+                    `$derivedPin = Get-TpmDerivedApiPin -FallbackKeyPath '$sshKeyPath.pub'
+                    if (`$derivedPin) { `$apiPin = `$derivedPin }
+                }
+                `$rawBytes = Read-Tpm2Nv -Context `$ctx -NvIndex $ApiNvIndex -Pin `$apiPin
                 `$raw = [System.Text.Encoding]::UTF8.GetString(`$rawBytes).TrimEnd([char]0)
-                `$foundKv = `$false
-                foreach (`$seg in (`$raw -split ';')) {
-                    if ([string]::IsNullOrEmpty(`$seg)) { continue }
-                    if (`$seg -match '^(?<name>[A-Za-z_][A-Za-z0-9_]*)="(?<value>.*)"$') {
-                        [Environment]::SetEnvironmentVariable(`$Matches['name'], `$Matches['value'], 'Process')
-                        Write-Host "[TPM] Loaded env var: `$(`$Matches['name'])"
-                        `$foundKv = `$true
-                    }
-                }
-                if (-not `$foundKv) {
-                    `$env:SECURE_API_KEY = `$raw
-                    if (`$raw) { Write-Host "[TPM] API Key loaded." }
-                }
+                Set-TpmSecretFromRaw -Raw `$raw
             } catch {
                 Write-Host "[TPM] Error: Failed to load API secret: `$_"
             }
