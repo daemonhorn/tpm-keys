@@ -70,12 +70,16 @@ function unlock_tpm { Write-Host "unlock" }
     Test-Fail "could not extract blockPattern regex from tpm_setup.ps1"
 }
 
-# The elevation self-relaunch must forward -Uninstall (and any other bound
-# parameter) to the elevated child, or it would silently run a plain
-# interactive setup instead of uninstalling.
-if ($scriptText -match 'foreach \(\$paramName in \$PSBoundParameters\.Keys\)' -and
+# The elevation self-relaunch must forward -Uninstall (and -EnvFile) to the
+# elevated child, or it would silently run a plain interactive setup
+# instead of uninstalling. There's no formal param() block (CLI parsing is
+# manual so a mistyped flag can show usage instead of a raw PowerShell
+# binder error -- see tpm_setup.sh's --status test suite for the parallel
+# on the sh side), so forwarding is built from the parsed $EnvFile/
+# $Uninstall/$Status variables rather than $PSBoundParameters.
+if ($scriptText -match "if \(\`$Uninstall\) \{ \`$forwardArgs \+= '-Uninstall' \}" -and
     $scriptText -match '@forwardArgs') {
-    Test-Pass "elevation relaunch forwards bound parameters (e.g. -Uninstall) to the elevated child"
+    Test-Pass "elevation relaunch forwards -Uninstall (and -EnvFile) to the elevated child"
 } else {
     Test-Fail "elevation relaunch does not forward parameters -- -Uninstall would be silently dropped on relaunch"
 }

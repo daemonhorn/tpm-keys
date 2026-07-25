@@ -5,6 +5,28 @@
 
 set -e
 
+# Shared by both a clean -h/--help request and any CLI syntax error below,
+# so a mistyped flag shows the same usage a deliberate --help would --
+# printed before the error line so the error is the last thing on screen
+# rather than scrolled out of view by the help text.
+print_usage() {
+    printf "%s\n" "Seals your SSH key and API key/token secrets inside this machine's TPM 2.0,"
+    printf "%s\n" "protected by one Master PIN, and wires up automatic (or on-demand) unlocking"
+    printf "%s\n" "in new shells for bash/sh and tcsh -- run with no arguments to seed a secret."
+    printf "%s\n" "Reads/writes the same TPM NV RAM indices as tpm_setup.ps1, so a dual-booted"
+    printf "%s\n" "machine can seal a secret in one OS and unlock it in the other."
+    printf "\n"
+    printf "Usage: %s [--env-file <path>] [--uninstall] [--status]\n\n" "$0"
+    printf "%s\n" "  --env-file <path>  Read the API key/value(s) to seal from a dotenv-style"
+    printf "%s\n" "                     file (NAME=VALUE per line) instead of the interactive"
+    printf "%s\n" "                     Phase 2 prompt."
+    printf "%s\n" "  --uninstall        Remove this user's sealed secrets from the TPM and the"
+    printf "%s\n" "                     unlock_tpm hooks from shell startup files, then exit."
+    printf "%s\n" "  --status           Print a summary of the current state (installed,"
+    printf "%s\n" "                     locked/unlocked, ssh-agent) and exit -- makes no"
+    printf "%s\n" "                     changes."
+}
+
 # --- CLI argument parsing ---
 ENV_FILE=""
 UNINSTALL=0
@@ -13,7 +35,8 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --env-file)
             if [ "$#" -lt 2 ]; then
-                printf "[TPM] ERROR: --env-file requires a path argument.\n"
+                print_usage
+                printf "\n[TPM] ERROR: --env-file requires a path argument.\n" >&2
                 exit 1
             fi
             ENV_FILE="$2"
@@ -32,25 +55,12 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         -h | --help)
-            printf "%s\n" "Seals your SSH key and API key/token secrets inside this machine's TPM 2.0,"
-            printf "%s\n" "protected by one Master PIN, and wires up automatic (or on-demand) unlocking"
-            printf "%s\n" "in new shells for bash/sh and tcsh -- run with no arguments to seed a secret."
-            printf "%s\n" "Reads/writes the same TPM NV RAM indices as tpm_setup.ps1, so a dual-booted"
-            printf "%s\n" "machine can seal a secret in one OS and unlock it in the other."
-            printf "\n"
-            printf "Usage: %s [--env-file <path>] [--uninstall] [--status]\n\n" "$0"
-            printf "%s\n" "  --env-file <path>  Read the API key/value(s) to seal from a dotenv-style"
-            printf "%s\n" "                     file (NAME=VALUE per line) instead of the interactive"
-            printf "%s\n" "                     Phase 2 prompt."
-            printf "%s\n" "  --uninstall        Remove this user's sealed secrets from the TPM and the"
-            printf "%s\n" "                     unlock_tpm hooks from shell startup files, then exit."
-            printf "%s\n" "  --status           Print a summary of the current state (installed,"
-            printf "%s\n" "                     locked/unlocked, ssh-agent) and exit -- makes no"
-            printf "%s\n" "                     changes."
+            print_usage
             exit 0
             ;;
         *)
-            printf "[TPM] ERROR: Unknown argument: %s\n" "$1"
+            print_usage
+            printf "\n[TPM] ERROR: Unknown argument: %s\n" "$1" >&2
             exit 1
             ;;
     esac

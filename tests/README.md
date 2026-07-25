@@ -59,7 +59,15 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
 - `test_help.sh` -- runs `tpm_setup.sh --help`/`-h` and (if `pwsh` is
   available) `tpm_setup.ps1 -Help`/`-h`, checking each exits 0 and mentions
   every other CLI flag the script currently supports, so adding a new flag
-  without updating its usage text shows up as a test failure.
+  without updating its usage text shows up as a test failure. Also runs
+  each script with an unknown flag and with `--env-file`/`-EnvFile` given
+  no value, checking each exits non-zero and *also* prints that same usage
+  text -- a CLI syntax error should point at the fix, not just say "no".
+  On the PowerShell side this is why `tpm_setup.ps1` parses `$args` by hand
+  instead of using a formal `param()` block: PowerShell's own parameter
+  binder rejects an unrecognized or malformed flag before a single line of
+  the script runs, which would make showing custom usage text on a typo
+  impossible.
 - `test_ssh_agent_key_check.sh` -- regression test for a real logic flaw:
   Phase 3's "no key file, generate one?" prompt didn't check whether
   ssh-agent already had an ED25519 identity loaded (e.g. a hardware

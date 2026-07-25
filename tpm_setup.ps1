@@ -18,30 +18,11 @@ from the standard-user list. Run this script itself elevated; day-to-day
 use afterwards (unlock_tpm) does not need elevation.
 #>
 
-param(
-    # Optional: read the API key/value(s) to seal from a dotenv-style file
-    # (NAME=VALUE per line) instead of the interactive Phase 2 prompt. See
-    # Get-TpmEnvFileSecret below for the exact accepted format.
-    [string]$EnvFile,
-
-    # Remove this user's sealed secrets from the TPM and the unlock_tpm
-    # hook from $PROFILE, then exit -- skips the rest of setup entirely.
-    [switch]$Uninstall,
-
-    # Print a read-only summary of the current state and exit -- makes no
-    # changes (no install, no seeding, no elevation).
-    [switch]$Status,
-
-    # Print usage and exit.
-    [Alias('h')]
-    [switch]$Help
-)
-
 $ErrorActionPreference = 'Stop'
 
 function Write-TpmLine { param([string]$Text) Write-Host $Text }
 
-if ($Help) {
+function Show-TpmUsage {
     Write-TpmLine "Seals your SSH key and API key/token secrets inside this machine's TPM 2.0,"
     Write-TpmLine "protected by one Master PIN, and wires up automatic (or on-demand) unlocking"
     Write-TpmLine "in new PowerShell sessions -- run with no arguments to seed a secret. Reads/"
@@ -58,6 +39,47 @@ if ($Help) {
     Write-TpmLine "  -Status          Print a summary of the current state (installed,"
     Write-TpmLine "                   locked/unlocked, ssh-agent) and exit -- makes no changes."
     Write-TpmLine "  -Help, -h        Show this help and exit."
+}
+
+# --- CLI argument parsing ---
+# Deliberately not a formal param() block: PowerShell's own parameter
+# binder rejects an unrecognized or malformed flag before a single line of
+# this script runs, which would make it impossible to show our own usage
+# text on a typo. Parsing $args by hand -- mirroring tpm_setup.sh's manual
+# case-based loop -- is the only way to catch that from inside the script,
+# so a mistyped flag shows the same usage a deliberate -Help would.
+$EnvFile = ''
+$Uninstall = $false
+$Status = $false
+$Help = $false
+$argIndex = 0
+while ($argIndex -lt $args.Count) {
+    $arg = $args[$argIndex]
+    switch ($arg) {
+        '-EnvFile' {
+            if ($argIndex + 1 -ge $args.Count) {
+                Show-TpmUsage
+                Write-TpmLine ""
+                Write-TpmLine "[TPM] ERROR: -EnvFile requires a path argument."
+                exit 1
+            }
+            $EnvFile = $args[$argIndex + 1]
+            $argIndex += 2
+        }
+        '-Uninstall' { $Uninstall = $true; $argIndex += 1 }
+        '-Status' { $Status = $true; $argIndex += 1 }
+        { $_ -in @('-Help', '-h') } { $Help = $true; $argIndex += 1 }
+        default {
+            Show-TpmUsage
+            Write-TpmLine ""
+            Write-TpmLine "[TPM] ERROR: Unknown argument: $arg"
+            exit 1
+        }
+    }
+}
+
+if ($Help) {
+    Show-TpmUsage
     exit 0
 }
 
@@ -713,20 +735,18 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         # shell is running under, so without it, an unsigned script here would
         # fail to load under a CurrentUser/LocalMachine policy of AllSigned or
         # Restricted even though the current, non-elevated invocation succeeded.
-        # Forward whatever named parameters this invocation was given (e.g.
-        # -EnvFile, -Uninstall) to the elevated child -- otherwise they'd be
-        # silently dropped and the relaunch would run a plain interactive
-        # setup instead of what was actually asked for.
+        # Forward whatever flags this invocation was given (e.g. -EnvFile,
+        # -Uninstall) to the elevated child -- otherwise they'd be silently
+        # dropped and the relaunch would run a plain interactive setup
+        # instead of what was actually asked for. -Status/-Help both exit
+        # long before this point is ever reached, so only -EnvFile and
+        # -Uninstall can actually be set here, but forwarding all of them
+        # (from the $args parse above, not $PSBoundParameters -- there's no
+        # formal param() block anymore) keeps this correct if that ever changes.
         $forwardArgs = @()
-        foreach ($paramName in $PSBoundParameters.Keys) {
-            $paramValue = $PSBoundParameters[$paramName]
-            if ($paramValue -is [switch]) {
-                if ($paramValue.IsPresent) { $forwardArgs += "-$paramName" }
-            } else {
-                $forwardArgs += "-$paramName"
-                $forwardArgs += $paramValue
-            }
-        }
+        if ($EnvFile) { $forwardArgs += '-EnvFile'; $forwardArgs += $EnvFile }
+        if ($Uninstall) { $forwardArgs += '-Uninstall' }
+        if ($Status) { $forwardArgs += '-Status' }
         & $sudoCmd.Source $pwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forwardArgs
         exit $LASTEXITCODE
     }

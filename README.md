@@ -85,6 +85,10 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
 | `--status` | `-Status` | Print a summary of the current state and exit — makes no changes — see [Checking status](#checking-status). |
 | `-h`, `--help` | `-h`, `-Help` | Print usage and exit. |
 
+An unrecognized flag, or `--env-file`/`-EnvFile` given no path, prints this
+same usage text before exiting non-zero, rather than a bare error with no
+guidance.
+
 ## What the script does
 
 1. **Phase 1 — OS detection & prerequisites**: detects your distro,
