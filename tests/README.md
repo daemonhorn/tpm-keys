@@ -32,6 +32,14 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   alias was defined. Proves the underlying tcsh behavior directly, then
   checks that the actual generated `.cshrc` uses the multi-line
   `if/then/endif` form instead.
+- `test_bash_profile_bootstrap.sh` -- regression test for a real bug found
+  and fixed after initial release: bash invoked as a *login* shell (its own
+  `/etc/passwd` entry, not just an interactive preference -- notably on
+  FreeBSD, whose `skel(5)` ships no bash-specific dotfiles) never reads
+  `~/.bashrc` at all; it only checks `~/.bash_profile`, `~/.bash_login`,
+  then `~/.profile`. Confirms Phase 5 creates/updates `~/.bash_profile` to
+  source `~/.bashrc`, that the block is idempotent across re-runs, and that
+  `~/.bashrc` has a guard against running twice in the same shell.
 - `lib/extract.sh` -- pulls a single named function's source out of
   `tpm_setup.sh` so these tests exercise the real shipped code rather than
   a reimplementation that could drift out of sync with it.

@@ -789,6 +789,15 @@ printf "\n%s\n" "=== Phase 5: Integrating with Shells ==="
 # 1. SH/BASH Payload
 SHRC_SNIPPET='
 # --- TPM Secure Environment Setup (sh/bash) ---
+# Guards against running twice in the same shell -- e.g. the
+# ~/.bash_profile bootstrap below sourcing ~/.bashrc, on top of a shell
+# that reaches this file some other way too. Re-running unlock_tpm'"'"'s
+# trailer a second time is harmless on its own (it just re-checks and
+# reports "already loaded"), but this avoids the redundant work/output.
+if [ -n "$_TPM_RC_LOADED" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+_TPM_RC_LOADED=1
 TPM_API_AUTH_MODE='"$API_AUTH_MODE"'
 TPM_SSH_PUB_PATH="'"$SSH_KEY_PATH"'.pub"
 
@@ -1298,6 +1307,25 @@ for SH_FILE in "$HOME/.shrc" "$HOME/.bashrc"; do
         printf "Added sh/bash automation to %s\n" "$SH_FILE"
     fi
 done
+
+# bash invoked as a LOGIN shell (its own /etc/passwd entry -- common when
+# bash is the account's login shell, e.g. FreeBSD, whose skel(5) doesn't
+# ship any bash-specific dotfiles at all) never reads ~/.bashrc: it only
+# checks ~/.bash_profile, then ~/.bash_login, then ~/.profile, stopping at
+# the first one that exists, same as ~/.shrc/~/.bashrc above -- so a bare
+# login session would silently never see the unlock_tpm hook. Ensure
+# ~/.bash_profile sources ~/.bashrc; harmless if some other file already
+# does, since the block above guards against running twice.
+BASH_PROFILE_SNIPPET='
+# --- TPM Secure Environment Setup (bash_profile bootstrap) ---
+if [ -f "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi
+# ----------------------------------------------'
+sed -i.bak '/# --- TPM Secure Environment Setup (bash_profile bootstrap) ---/,/# ----------------------------------------------/d' "$HOME/.bash_profile" 2>/dev/null || true
+rm -f "$HOME/.bash_profile.bak"
+printf "%s\n" "$BASH_PROFILE_SNIPPET" >> "$HOME/.bash_profile"
+printf "Added bash_profile bootstrap (sources .bashrc for bash login shells) to %s\n" "$HOME/.bash_profile"
 
 CSHRC_FILE="$HOME/.cshrc"
 sed -i.bak '/# --- TPM Secure Environment Setup (tcsh) ---/,/# -------------------------------------------/d' "$CSHRC_FILE" 2>/dev/null || true

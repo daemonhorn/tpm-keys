@@ -86,7 +86,9 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
    NV index, you're asked to confirm before it's overwritten.
 5. **Phase 5 — shell integration**: installs an `unlock_tpm` function/alias
    into `~/.bashrc`, `~/.shrc`, and `~/.cshrc` (re-running the script
-   replaces the old block cleanly rather than duplicating it).
+   replaces the old block cleanly rather than duplicating it). Also ensures
+   `~/.bash_profile` sources `~/.bashrc` — see
+   [bash as a login shell](#bash-as-a-login-shell) below for why.
 
 ## Usage examples
 
@@ -237,6 +239,25 @@ the environment), `unlock_tpm` just reports:
 
 This works identically whether your login shell is **bash/sh** or **tcsh**.
 
+### bash as a login shell
+
+If your account's login shell is `bash` itself (its `/etc/passwd` entry, not
+just your interactive preference) — common on FreeBSD, whose `skel(5)`
+doesn't ship any bash-specific dotfiles — a real login session **never
+reads `~/.bashrc` at all**. This is standard bash behavior, not a FreeBSD
+quirk: bash-as-a-login-shell only checks `~/.bash_profile`, then
+`~/.bash_login`, then `~/.profile`, stopping at the first one that exists,
+and none of those is `~/.bashrc`. It's usually invisible on Linux distros
+whose default `~/.bash_profile` already sources `~/.bashrc` for you — but
+FreeBSD's skeleton doesn't, so the `unlock_tpm` hook would otherwise never
+fire on a genuine login.
+
+Phase 5 handles this by ensuring `~/.bash_profile` sources `~/.bashrc`
+(creating it if it doesn't exist yet, and idempotently on re-run, same as
+the other shell files). If something else already sources `~/.bashrc` too
+(another line in your own `~/.bash_profile`, for instance), that's harmless
+— the TPM block guards against running twice in the same shell.
+
 ## Re-running the script
 
 Running `tpm_setup.sh` again is safe:
@@ -246,8 +267,9 @@ Running `tpm_setup.sh` again is safe:
 - If a secret already exists at your TPM NV index (API key or SSH key), it
   asks for explicit confirmation before overwriting it — nothing is
   destroyed silently.
-- The `unlock_tpm` blocks added to `~/.bashrc`/`~/.shrc`/`~/.cshrc` are
-  replaced in place, not duplicated.
+- The `unlock_tpm` blocks added to `~/.bashrc`/`~/.shrc`/`~/.cshrc` (and the
+  bootstrap line in `~/.bash_profile`) are replaced in place, not
+  duplicated.
 - Whether the API Key is sealed under the Master PIN or an SSH-agent-derived
   PIN, and whether ssh-agent Autostart is enabled, are both remembered in
   `~/.tpm_keys_state`, so re-running without re-seeding (keeping existing

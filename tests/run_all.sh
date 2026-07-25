@@ -24,6 +24,7 @@ run_suite() {
 run_suite "sentinel header (sh)" sh "$SCRIPT_DIR/test_sentinel_header.sh"
 run_suite "env file parser (sh)" sh "$SCRIPT_DIR/test_env_file_parser.sh"
 run_suite "tcsh alias regression" sh "$SCRIPT_DIR/test_tcsh_alias_bug.sh"
+run_suite "bash_profile bootstrap" sh "$SCRIPT_DIR/test_bash_profile_bootstrap.sh"
 
 if command -v pwsh >/dev/null 2>&1; then
     run_suite "sentinel header (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_sentinel_header.ps1"
