@@ -27,6 +27,12 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         -h | --help)
+            printf "%s\n" "Seals your SSH key and API key/token secrets inside this machine's TPM 2.0,"
+            printf "%s\n" "protected by one Master PIN, and wires up automatic (or on-demand) unlocking"
+            printf "%s\n" "in new shells for bash/sh and tcsh -- run with no arguments to seed a secret."
+            printf "%s\n" "Reads/writes the same TPM NV RAM indices as tpm_setup.ps1, so a dual-booted"
+            printf "%s\n" "machine can seal a secret in one OS and unlock it in the other."
+            printf "\n"
             printf "Usage: %s [--env-file <path>] [--uninstall]\n\n" "$0"
             printf "%s\n" "  --env-file <path>  Read the API key/value(s) to seal from a dotenv-style"
             printf "%s\n" "                     file (NAME=VALUE per line) instead of the interactive"

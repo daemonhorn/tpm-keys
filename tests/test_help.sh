@@ -1,8 +1,9 @@
 #!/bin/sh
-# Tests --help/-h (tpm_setup.sh) and -Help/-h (tpm_setup.ps1): exits 0 and
-# mentions every other CLI flag the script currently supports, so adding a
-# new flag without updating its usage text shows up as a test failure
-# instead of silently going stale.
+# Tests --help/-h (tpm_setup.sh) and -Help/-h (tpm_setup.ps1): exits 0,
+# includes a one-paragraph summary of what the script does, and mentions
+# every other CLI flag the script currently supports -- so adding a new
+# flag (or dropping the summary) without updating usage text shows up as
+# a test failure instead of silently going stale.
 set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
@@ -34,17 +35,17 @@ check_output() {
 }
 
 OUT=$(sh "$REPO_ROOT/tpm_setup.sh" --help 2>&1); CODE=$?
-check_output "tpm_setup.sh --help" "$OUT" "$CODE" "--env-file" "--uninstall"
+check_output "tpm_setup.sh --help" "$OUT" "$CODE" "--env-file" "--uninstall" "TPM 2.0"
 
 OUT=$(sh "$REPO_ROOT/tpm_setup.sh" -h 2>&1); CODE=$?
-check_output "tpm_setup.sh -h" "$OUT" "$CODE" "--env-file" "--uninstall"
+check_output "tpm_setup.sh -h" "$OUT" "$CODE" "--env-file" "--uninstall" "TPM 2.0"
 
 if command -v pwsh >/dev/null 2>&1; then
     OUT=$(pwsh -NoProfile -File "$REPO_ROOT/tpm_setup.ps1" -Help 2>&1); CODE=$?
-    check_output "tpm_setup.ps1 -Help" "$OUT" "$CODE" "-EnvFile" "-Uninstall"
+    check_output "tpm_setup.ps1 -Help" "$OUT" "$CODE" "-EnvFile" "-Uninstall" "TPM 2.0"
 
     OUT=$(pwsh -NoProfile -File "$REPO_ROOT/tpm_setup.ps1" -h 2>&1); CODE=$?
-    check_output "tpm_setup.ps1 -h" "$OUT" "$CODE" "-EnvFile" "-Uninstall"
+    check_output "tpm_setup.ps1 -h" "$OUT" "$CODE" "-EnvFile" "-Uninstall" "TPM 2.0"
 else
     printf "SKIP: pwsh not installed, skipping tpm_setup.ps1 -Help checks\n"
 fi

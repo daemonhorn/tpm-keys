@@ -38,6 +38,12 @@ $ErrorActionPreference = 'Stop'
 function Write-TpmLine { param([string]$Text) Write-Host $Text }
 
 if ($Help) {
+    Write-TpmLine "Seals your SSH key and API key/token secrets inside this machine's TPM 2.0,"
+    Write-TpmLine "protected by one Master PIN, and wires up automatic (or on-demand) unlocking"
+    Write-TpmLine "in new PowerShell sessions -- run with no arguments to seed a secret. Reads/"
+    Write-TpmLine "writes the same TPM NV RAM indices as tpm_setup.sh, so a dual-booted machine"
+    Write-TpmLine "can seal a secret in one OS and unlock it in the other."
+    Write-TpmLine ""
     Write-TpmLine "Usage: pwsh -File tpm_setup.ps1 [-EnvFile <path>] [-Uninstall] [-Help]"
     Write-TpmLine ""
     Write-TpmLine "  -EnvFile <path>  Read the API key/value(s) to seal from a dotenv-style file"
