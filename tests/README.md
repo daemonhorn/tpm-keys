@@ -40,6 +40,11 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   then `~/.profile`. Confirms Phase 5 creates/updates `~/.bash_profile` to
   source `~/.bashrc`, that the block is idempotent across re-runs, and that
   `~/.bashrc` has a guard against running twice in the same shell.
+- `test_freebsd_sudo_bootstrap.sh` -- tests the FreeBSD `sudo`-bootstrap
+  logic (FreeBSD's base system doesn't ship `sudo`, and everything from the
+  `tpm2-tools` install onward assumes it's already there): covers running
+  as root vs. needing `su`, and install success vs. failure, with fake
+  `id`/`pkg`/`su` stubs so it doesn't touch the real system.
 - `lib/extract.sh` -- pulls a single named function's source out of
   `tpm_setup.sh` so these tests exercise the real shipped code rather than
   a reimplementation that could drift out of sync with it.

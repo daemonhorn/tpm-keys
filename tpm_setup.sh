@@ -87,6 +87,42 @@ case "$DISTRO" in
         ;;
     "freebsd")
         printf "%s\n" "Detected FreeBSD."
+        # FreeBSD's base system doesn't include sudo (unlike most Linux
+        # distros' default images) -- and everything below this point,
+        # starting with the tpm2-tools install a few lines down, assumes
+        # it's already there. Bootstrap it now rather than let the first
+        # "sudo: not found" a dozen lines from now be the only clue.
+        if ! command -v sudo >/dev/null 2>&1; then
+            printf "%s\n" "[TPM] 'sudo' not found; this script needs it for privileged operations"
+            printf "%s\n" "(package installs, kernel module loading, group management, devfs rules)."
+            if [ "$(id -u)" -eq 0 ]; then
+                printf "%s\n" "Installing sudo (running as root)..."
+                SUDO_INSTALL_OK=1
+                pkg install -y sudo || SUDO_INSTALL_OK=0
+            else
+                printf "%s\n" "Installing it via 'su' to root -- you may be prompted for the root password."
+                SUDO_INSTALL_OK=1
+                su root -c 'pkg install -y sudo' || SUDO_INSTALL_OK=0
+            fi
+            if [ "$SUDO_INSTALL_OK" -eq 1 ] && command -v sudo >/dev/null 2>&1; then
+                printf "%s\n" "[TPM] sudo installed successfully."
+            else
+                printf "\n%s\n" "================================================================"
+                printf "%s\n"   " ERROR: 'sudo' is required but could not be installed"
+                printf "%s\n"   "================================================================"
+                printf "%s\n" "This script relies on 'sudo' for privileged operations and could"
+                printf "%s\n" "not install it automatically (wrong/unknown root password, or this"
+                printf "%s\n" "account isn't in the 'wheel' group su(1) requires to become root)."
+                printf "%s\n" ""
+                printf "%s\n" "To proceed, have an administrator (or yourself, with the root"
+                printf "%s\n" "password) run:"
+                printf "%s\n" "    su root -c 'pkg install -y sudo'"
+                printf "%s\n" "then make sure your user is permitted to use it (see visudo or"
+                printf "%s\n" "/usr/local/etc/sudoers, typically uncommenting the '%wheel' line"
+                printf "%s\n" "and adding your user to that group), and re-run this script."
+                exit 1
+            fi
+        fi
         PKG_MGR="sudo pkg install -y tpm2-tools"
         TPM_DEV="/dev/tpm0"
         GROUP_NAME="_tss"

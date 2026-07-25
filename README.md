@@ -49,6 +49,17 @@ key into `ssh-agent` and the API key(s) into your environment.
 - Membership in the `_tss` group (created automatically), plus a
   `/dev/tpm0` devfs rule (`own tpm0 root:_tss`, `perm tpm0 0660`) that the
   script adds to `/etc/devfs.conf` for you.
+- **`sudo`.** Unlike most Linux distro base images, FreeBSD's base system
+  doesn't include `sudo` at all — everything from the `tpm2-tools` install
+  onward assumes it's there. Phase 1 checks for it and installs it
+  automatically (`pkg install -y sudo`, directly if you're already root, or
+  via `su` — you may be prompted for the root password) if missing. If
+  that fails (unknown root password, or your account isn't in the `wheel`
+  group `su(1)` requires), it prints exactly what to run — have an
+  administrator (or yourself, with the root password) run
+  `su root -c 'pkg install -y sudo'`, confirm your user is permitted to use
+  it (`visudo` / `/usr/local/etc/sudoers`, typically the `%wheel` line),
+  and re-run this script.
 
 ## Installation
 
