@@ -56,6 +56,10 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   block-removal regex, that the elevation self-relaunch forwards `-Uninstall`
   to the elevated child) since the full flow needs Windows-only
   `WindowsPrincipal`/TBS access not available outside Windows.
+- `test_help.sh` -- runs `tpm_setup.sh --help`/`-h` and (if `pwsh` is
+  available) `tpm_setup.ps1 -Help`/`-h`, checking each exits 0 and mentions
+  every other CLI flag the script currently supports, so adding a new flag
+  without updating its usage text shows up as a test failure.
 - `lib/extract.sh` -- pulls a single named function's source out of
   `tpm_setup.sh` so these tests exercise the real shipped code rather than
   a reimplementation that could drift out of sync with it.

@@ -27,6 +27,7 @@ run_suite "tcsh alias regression" sh "$SCRIPT_DIR/test_tcsh_alias_bug.sh"
 run_suite "bash_profile bootstrap" sh "$SCRIPT_DIR/test_bash_profile_bootstrap.sh"
 run_suite "FreeBSD sudo bootstrap" sh "$SCRIPT_DIR/test_freebsd_sudo_bootstrap.sh"
 run_suite "uninstall (sh)" sh "$SCRIPT_DIR/test_uninstall.sh"
+run_suite "--help usage text" sh "$SCRIPT_DIR/test_help.sh"
 
 if command -v pwsh >/dev/null 2>&1; then
     run_suite "sentinel header (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_sentinel_header.ps1"

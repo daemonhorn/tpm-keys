@@ -26,12 +26,28 @@ param(
 
     # Remove this user's sealed secrets from the TPM and the unlock_tpm
     # hook from $PROFILE, then exit -- skips the rest of setup entirely.
-    [switch]$Uninstall
+    [switch]$Uninstall,
+
+    # Print usage and exit.
+    [Alias('h')]
+    [switch]$Help
 )
 
 $ErrorActionPreference = 'Stop'
 
 function Write-TpmLine { param([string]$Text) Write-Host $Text }
+
+if ($Help) {
+    Write-TpmLine "Usage: pwsh -File tpm_setup.ps1 [-EnvFile <path>] [-Uninstall] [-Help]"
+    Write-TpmLine ""
+    Write-TpmLine "  -EnvFile <path>  Read the API key/value(s) to seal from a dotenv-style file"
+    Write-TpmLine "                   (NAME=VALUE per line) instead of the interactive Phase 2"
+    Write-TpmLine "                   prompt."
+    Write-TpmLine "  -Uninstall       Remove this user's sealed secrets from the TPM and the"
+    Write-TpmLine "                   unlock_tpm hook from `$PROFILE, then exit."
+    Write-TpmLine "  -Help, -h        Show this help and exit."
+    exit 0
+}
 
 Write-TpmLine "=== Phase 1: Prerequisites ==="
 

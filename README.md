@@ -76,6 +76,14 @@ The script is interactive and safe to re-run — running it again on a
 machine with a group change pending, or with keys already sealed, is
 handled gracefully (see [Re-running the script](#re-running-the-script)).
 
+### Command-line options
+
+| `tpm_setup.sh` | `tpm_setup.ps1` | Does |
+|---|---|---|
+| `--env-file <path>`, `--env-file=<path>` | `-EnvFile <path>` | Seed from a dotenv-style file instead of the interactive prompt — see [Loading secrets from a file](#loading-secrets-from-a-file---env-file). |
+| `--uninstall` | `-Uninstall` | Remove this user's sealed secrets and shell/profile hooks, then exit — see [Uninstalling](#uninstalling). |
+| `-h`, `--help` | `-h`, `-Help` | Print usage and exit. |
+
 ## What the script does
 
 1. **Phase 1 — OS detection & prerequisites**: detects your distro,
