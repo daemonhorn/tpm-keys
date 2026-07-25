@@ -142,20 +142,33 @@ if [ "$STATUS" -eq 1 ]; then
     # tpm2-tools or fix group/device access the way normal setup would.
     API_INSTALLED=0
     SSH_INSTALLED=0
+    TPM_ACCESSIBLE=0
     if command -v tpm2_nvreadpublic >/dev/null 2>&1; then
-        tpm2_nvreadpublic "$API_NV_INDEX" >/dev/null 2>&1 && API_INSTALLED=1
-        tpm2_nvreadpublic "$SSH_NV_INDEX" >/dev/null 2>&1 && SSH_INSTALLED=1
-        if [ "$API_INSTALLED" -eq 1 ] && [ "$SSH_INSTALLED" -eq 1 ]; then
-            printf "TPM secrets: installed (API %s, SSH %s)\n" "$API_NV_INDEX" "$SSH_NV_INDEX"
-        elif [ "$API_INSTALLED" -eq 0 ] && [ "$SSH_INSTALLED" -eq 0 ]; then
-            printf "TPM secrets: not installed (or TPM device not accessible)\n"
-        else
-            printf "TPM secrets: partially installed (API %s, SSH %s)\n" \
-                "$( [ "$API_INSTALLED" -eq 1 ] && printf present || printf missing )" \
-                "$( [ "$SSH_INSTALLED" -eq 1 ] && printf present || printf missing )"
+        # Probe TPM reachability independently of whether OUR indices exist:
+        # tpm2_getcap needs no PIN and succeeds against any reachable TPM,
+        # so its result tells apart "can't talk to the TPM at all" (no
+        # device, permissions, tpm2-abrmd not running, ...) from "TPM is
+        # fine, nothing sealed here yet" -- these used to be reported with
+        # the same ambiguous message.
+        if tpm2_getcap properties-fixed >/dev/null 2>&1; then
+            TPM_ACCESSIBLE=1
+            tpm2_nvreadpublic "$API_NV_INDEX" >/dev/null 2>&1 && API_INSTALLED=1
+            tpm2_nvreadpublic "$SSH_NV_INDEX" >/dev/null 2>&1 && SSH_INSTALLED=1
         fi
-    else
+    fi
+
+    if ! command -v tpm2_nvreadpublic >/dev/null 2>&1; then
         printf "TPM secrets: unknown (tpm2-tools not installed)\n"
+    elif [ "$TPM_ACCESSIBLE" -eq 0 ]; then
+        printf "TPM secrets: unknown (TPM not accessible -- check device permissions/group membership)\n"
+    elif [ "$API_INSTALLED" -eq 1 ] && [ "$SSH_INSTALLED" -eq 1 ]; then
+        printf "TPM secrets: installed (API %s, SSH %s)\n" "$API_NV_INDEX" "$SSH_NV_INDEX"
+    elif [ "$API_INSTALLED" -eq 0 ] && [ "$SSH_INSTALLED" -eq 0 ]; then
+        printf "TPM secrets: not installed\n"
+    else
+        printf "TPM secrets: partially installed (API %s, SSH %s)\n" \
+            "$( [ "$API_INSTALLED" -eq 1 ] && printf present || printf missing )" \
+            "$( [ "$SSH_INSTALLED" -eq 1 ] && printf present || printf missing )"
     fi
 
     if [ -f "$SSH_KEY_PATH" ]; then

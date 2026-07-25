@@ -326,10 +326,16 @@ Prints a succinct, one-item-per-line summary of the current state and exits
 anything:
 
 - Effective user and UID (`id -u` on Linux/FreeBSD; the UID you enter, or
-  the one derived from your Windows SID, on Windows) — this is what
-  determines which TPM NV indices are checked.
+  the one derived from your Windows SID, on Windows — see
+  [Cross-OS key sharing](#cross-os-key-sharing) for how Windows remembers
+  this after the first run) — this is what determines which TPM NV indices
+  are checked.
 - Whether TPM secrets are installed at those NV indices, not installed, or
-  only partially (e.g. the API key was sealed but the SSH key wasn't).
+  only partially (e.g. the API key was sealed but the SSH key wasn't) —
+  reported distinctly from the TPM itself being unreachable (tpm2-tools
+  missing, a device/permissions problem, or a TBS query failure), since
+  "nothing sealed yet" and "couldn't actually check" are different
+  problems and call for different next steps.
 - Whether `~/.ssh/id_ed25519` is present on disk.
 - Whether an ED25519 identity is currently loaded in ssh-agent (unlocked)
   or not (locked).
@@ -472,6 +478,12 @@ TPM NV indices are computed from a numeric UID (`22020096 + UID*2` and
 equivalent, so Phase 2 asks for the UID `tpm_setup.sh` used on the
 Linux/FreeBSD side of the dual boot (run `id -u` there). Leave it blank to
 use a Windows-only index instead (won't be shared with the other OS).
+
+Whichever UID you enter (or the Windows-derived one if you left it blank)
+is recorded in `$HOME\.tpm_keys\uid.txt`, so `-Status`, `-Uninstall`, and
+any later re-run of setup for this same Windows user reuse it silently
+instead of asking again. This breadcrumb is removed as part of
+`-Uninstall`'s cleanup, so the next setup after that starts fresh.
 
 ### Usage
 

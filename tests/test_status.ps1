@@ -38,7 +38,11 @@ function Test-Fail { param([string]$Name) $script:TestsRun++; $script:TestsFaile
 $MockTemplate = @'
 function Write-TpmLine { param([string]$Text) Write-Host $Text }
 function Read-Host { param($Prompt) return "__FAKEUID__" }
-function Connect-Tpm2 { return [IntPtr]::Zero }
+function Get-TpmUid { return __FAKEUID__ }
+function Connect-Tpm2 {
+    if (__CONNECTTHROWS__) { throw "simulated TBS session failure" }
+    return [IntPtr]::Zero
+}
 function Disconnect-Tpm2 { param($Context) }
 function Get-Tpm2NvPublic {
     param($Context, [uint32]$NvIndex)
@@ -85,14 +89,16 @@ function Invoke-StatusBlock {
         [bool]$ApiInstalled = $false,
         [bool]$SshInstalled = $false,
         [int]$SshAddExit = 2,
-        [bool]$AgentServiceRunning = $false
+        [bool]$AgentServiceRunning = $false,
+        [bool]$ConnectThrows = $false
     )
     $mockScript = $MockTemplate.
         Replace('__FAKEUID__', $FakeUid).
         Replace('__APIINSTALLED__', $(if ($ApiInstalled) { '$true' } else { '$false' })).
         Replace('__SSHINSTALLED__', $(if ($SshInstalled) { '$true' } else { '$false' })).
         Replace('__SSHADDEXIT__', "$SshAddExit").
-        Replace('__AGENTRUNNING__', $(if ($AgentServiceRunning) { '$true' } else { '$false' }))
+        Replace('__AGENTRUNNING__', $(if ($AgentServiceRunning) { '$true' } else { '$false' })).
+        Replace('__CONNECTTHROWS__', $(if ($ConnectThrows) { '$true' } else { '$false' }))
 
     # The real block ends with `exit 0`. Invoking it directly (`& $sb`) in
     # this process really does terminate the WHOLE test run the instant it
@@ -201,6 +207,22 @@ try {
         Test-Pass "untracked old install reports honestly instead of guessing"
     } else {
         Test-Fail "did not handle untracked old install correctly: $out"
+    }
+
+    # --- Case 6: TPM query fails (e.g. a transient TBS hiccup) -- must not
+    # be misreported as "not installed" (no secrets sealed yet). ---
+    $home6 = Join-Path $TMPDIR "home6"
+    New-Item -ItemType Directory -Path $home6 | Out-Null
+    $out = Invoke-StatusBlock -FakeHome $home6 -ConnectThrows $true
+    if ($out -match [regex]::Escape('TPM secrets: unknown (could not query the TPM')) {
+        Test-Pass "TPM query failure reported distinctly from 'not installed'"
+    } else {
+        Test-Fail "did not distinguish a TPM query failure from 'not installed': $out"
+    }
+    if ($out -match 'TPM secrets: not installed') {
+        Test-Fail "wrongly reported 'not installed' when the TPM query itself failed"
+    } else {
+        Test-Pass "did not conflate a TPM query failure with 'not installed'"
     }
 } finally {
     Remove-Item -Recurse -Force $TMPDIR -ErrorAction SilentlyContinue

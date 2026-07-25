@@ -75,18 +75,32 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   presence, environment secret count, and ssh-agent/loaded-identity state
   (including public key material). Covers not-installed, fully-installed
   and unlocked, partially loaded named secrets with an agent reachable but
-  empty, legacy single-key mode, and an older install that predates name
-  tracking. The `.sh` version runs the real extracted block under `sh -e`
-  (matching the real script's `set -e`) with fake `id`/`tpm2_nvreadpublic`/
-  `ssh-add` stubs on an isolated `PATH`, specifically to catch the class of
-  bug where capturing a failing command's exit code aborts the whole
-  script under `set -e` before the assignment runs. The `.ps1` version runs
-  the real extracted block in a background job (`Start-Job`/`Receive-Job`)
-  with `Connect-Tpm2`/`Get-Tpm2NvPublic`/`ssh-add`/`Get-Service` mocked as
-  literal text embedded in the same scriptblock -- the block ends with
-  `exit 0`, which running it directly in-process would take the whole test
-  runner down with it (confirmed by reproducing that exact failure during
-  development), and a job isolates `exit` to its own child process.
+  empty, legacy single-key mode, an older install that predates name
+  tracking, and -- since "no secrets sealed" and "couldn't even check" are
+  different problems that used to be reported identically -- a case where
+  the TPM itself can't be reached/queried, which must be reported as
+  unknown rather than misread as "not installed". The `.sh` version runs
+  the real extracted block under `sh -e` (matching the real script's
+  `set -e`) with fake `id`/`tpm2_nvreadpublic`/`tpm2_getcap`/`ssh-add`
+  stubs on an isolated `PATH`, specifically to catch the class of bug
+  where capturing a failing command's exit code aborts the whole script
+  under `set -e` before the assignment runs. The `.ps1` version runs the
+  real extracted block in a background job (`Start-Job`/`Receive-Job`)
+  with `Connect-Tpm2`/`Get-Tpm2NvPublic`/`Get-TpmUid`/`ssh-add`/
+  `Get-Service` mocked as literal text embedded in the same scriptblock --
+  the block ends with `exit 0`, which running it directly in-process would
+  take the whole test runner down with it (confirmed by reproducing that
+  exact failure during development), and a job isolates `exit` to its own
+  child process.
+- `test_uid_breadcrumb.ps1` -- tests `Get-TpmUid` (PowerShell-only), the
+  helper shared by `-Status`, `-Uninstall`, and the main setup flow's
+  cross-OS UID prompt: once a UID is determined it's recorded in
+  `$HOME\.tpm_keys\uid.txt` so later invocations for the same Windows user
+  reuse it without re-prompting. Covers the first-ever call (prompts,
+  persists the result), a second call (reuses the breadcrumb, does not
+  re-prompt), and a call after the breadcrumb directory is removed (as
+  `-Uninstall` leaves it) correctly asking again rather than reusing a
+  stale value.
 - `lib/extract.sh` -- pulls a single named function's source out of
   `tpm_setup.sh` so these tests exercise the real shipped code rather than
   a reimplementation that could drift out of sync with it.

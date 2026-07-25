@@ -36,6 +36,7 @@ if command -v pwsh >/dev/null 2>&1; then
     run_suite "env file parser (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_env_file_parser.ps1"
     run_suite "uninstall (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_uninstall.ps1"
     run_suite "-Status (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_status.ps1"
+    run_suite "UID breadcrumb (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_uid_breadcrumb.ps1"
 else
     printf "\n=== PowerShell tests ===\nSKIP: pwsh not installed\n"
 fi

@@ -500,6 +500,39 @@ function Test-Tpm2OwnerAuthHint {
     }
 }
 
+function Get-TpmUid {
+    # Once a UID is determined here (typed, or derived from this Windows
+    # session's own SID), remember it in a breadcrumb file so -Status,
+    # -Uninstall, and any later re-run of setup for this same Windows user
+    # reuse it without re-prompting. -Uninstall deletes the whole
+    # $HOME\.tpm_keys directory, so the breadcrumb goes with it -- a fresh
+    # UID is asked for again only after that cleanup.
+    $uidBreadcrumbFile = Join-Path (Join-Path $HOME ".tpm_keys") "uid.txt"
+    if (Test-Path $uidBreadcrumbFile) {
+        $savedUid = Get-Content -Path $uidBreadcrumbFile -Raw -ErrorAction SilentlyContinue
+        if ($savedUid) { $savedUid = $savedUid.Trim() }
+        if ($savedUid -match '^\d+$') {
+            Write-TpmLine "Using the UID recorded from a previous run ($savedUid) -- run with -Uninstall to reset this."
+            return [int]$savedUid
+        }
+    }
+
+    $uidInput = Read-Host "Enter that UID (or press Enter to use this Windows session's own scheme)"
+    if ([string]::IsNullOrEmpty($uidInput)) {
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $rid = [int]($sid.Split('-')[-1]) % 1000000
+        $uid = $rid
+        Write-TpmLine "Using a Windows-derived index (RID-based UID $uid) -- this will NOT match a Linux/FreeBSD-sealed secret."
+    } else {
+        $uid = [int]$uidInput
+    }
+
+    $uidBreadcrumbDir = Split-Path -Parent $uidBreadcrumbFile
+    if (-not (Test-Path $uidBreadcrumbDir)) { New-Item -ItemType Directory -Path $uidBreadcrumbDir -Force | Out-Null }
+    Set-Content -Path $uidBreadcrumbFile -Value "$uid" -NoNewline
+    return $uid
+}
+
 # 1. TPM presence
 # Get-Tpm (Win32_Tpm under the hood) needs an elevated process for a non-admin
 # caller -- but it doesn't throw or write to the error stream when it lacks
@@ -541,30 +574,37 @@ if ($Status) {
     # NOT install anything, start the ssh-agent service, or seed a secret.
     Write-TpmLine "`nTo read the SAME TPM NV indices as when this was sealed, this needs the"
     Write-TpmLine "same UID you entered (or left blank) during setup."
-    $uidInput = Read-Host "Enter that UID (or press Enter to use this Windows session's own scheme)"
-    if ([string]::IsNullOrEmpty($uidInput)) {
-        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $rid = [int]($sid.Split('-')[-1]) % 1000000
-        $uid = $rid
-    } else {
-        $uid = [int]$uidInput
-    }
+    $uid = Get-TpmUid
     $ApiNvIndex = [uint32](22020096 + $uid * 2)
     $SshNvIndex = [uint32](22020096 + $uid * 2 + 1)
 
     Write-TpmLine "`n=== TPM Status ==="
     Write-TpmLine "User: $([Environment]::UserName) (uid $uid)"
 
+    # The top-level TBS probe above already hard-exits if the TPM can't be
+    # reached at all, but a SECOND, independent Connect-Tpm2 here can still
+    # fail on its own (transient TBS hiccup, session limit, ...). Catch
+    # that separately from Get-Tpm2NvPublic's normal "Exists = $false" so a
+    # real query failure is reported as unknown rather than misread as "no
+    # secrets sealed" -- the same distinction tpm_setup.sh's --status makes
+    # between "TPM not accessible" and "TPM fine, nothing installed".
     $apiInstalled = $false
     $sshInstalled = $false
-    $statusCtx = Connect-Tpm2
+    $tpmQueryError = $null
     try {
-        $apiInstalled = (Get-Tpm2NvPublic -Context $statusCtx -NvIndex $ApiNvIndex).Exists
-        $sshInstalled = (Get-Tpm2NvPublic -Context $statusCtx -NvIndex $SshNvIndex).Exists
-    } finally {
-        Disconnect-Tpm2 -Context $statusCtx
+        $statusCtx = Connect-Tpm2
+        try {
+            $apiInstalled = (Get-Tpm2NvPublic -Context $statusCtx -NvIndex $ApiNvIndex).Exists
+            $sshInstalled = (Get-Tpm2NvPublic -Context $statusCtx -NvIndex $SshNvIndex).Exists
+        } finally {
+            Disconnect-Tpm2 -Context $statusCtx
+        }
+    } catch {
+        $tpmQueryError = $_
     }
-    if ($apiInstalled -and $sshInstalled) {
+    if ($tpmQueryError) {
+        Write-TpmLine "TPM secrets: unknown (could not query the TPM: $tpmQueryError)"
+    } elseif ($apiInstalled -and $sshInstalled) {
         Write-TpmLine "TPM secrets: installed (API 0x$($ApiNvIndex.ToString('X')), SSH 0x$($SshNvIndex.ToString('X')))"
     } elseif (-not $apiInstalled -and -not $sshInstalled) {
         Write-TpmLine "TPM secrets: not installed"
@@ -704,14 +744,7 @@ if ($Uninstall) {
     Write-TpmLine "`n=== Uninstall ==="
     Write-TpmLine "To read/write the SAME TPM NV indices this was originally sealed under,"
     Write-TpmLine "this needs the same UID you entered (or left blank) during setup."
-    $uidInput = Read-Host "Enter that UID (or press Enter to use this Windows session's own scheme)"
-    if ([string]::IsNullOrEmpty($uidInput)) {
-        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $rid = [int]($sid.Split('-')[-1]) % 1000000
-        $uid = $rid
-    } else {
-        $uid = [int]$uidInput
-    }
+    $uid = Get-TpmUid
     $ApiNvIndex = [uint32](22020096 + $uid * 2)
     $SshNvIndex = [uint32](22020096 + $uid * 2 + 1)
 
@@ -971,17 +1004,7 @@ if ($strategyChoice -ne '2') { $strategyChoice = '1' }
 # --- Cross-OS NV index matching ---
 Write-TpmLine "`nTo read/write the SAME TPM NV indices as tpm_setup.sh on Linux/FreeBSD, this"
 Write-TpmLine "needs the numeric UID that script used (run 'id -u' there to check)."
-$uidInput = Read-Host "Enter that UID (or press Enter to use this Windows session's own scheme)"
-if ([string]::IsNullOrEmpty($uidInput)) {
-    # No cross-OS sharing requested: derive a UID-like value from the Windows
-    # SID's RID so repeated runs by the same user stay stable.
-    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $rid = [int]($sid.Split('-')[-1]) % 1000000
-    $uid = $rid
-    Write-TpmLine "Using a Windows-derived index (RID-based UID $uid) -- this will NOT match a Linux/FreeBSD-sealed secret."
-} else {
-    $uid = [int]$uidInput
-}
+$uid = Get-TpmUid
 $ApiNvIndex = [uint32](22020096 + $uid * 2)
 $SshNvIndex = [uint32](22020096 + $uid * 2 + 1)
 Write-TpmLine ("API NV index: 0x{0:X}, SSH NV index: 0x{1:X}" -f $ApiNvIndex, $SshNvIndex)

@@ -32,6 +32,15 @@ cat > "$FAKEBIN/tpm2_nvreadpublic" <<'EOF'
 [ "$FAKE_TPM_INSTALLED" = "1" ] && exit 0
 exit 1
 EOF
+cat > "$FAKEBIN/tpm2_getcap" <<'EOF'
+#!/bin/sh
+# FAKE_TPM_ACCESSIBLE (default 1): simulates whether the TPM itself can be
+# reached at all, independent of whether our own NV indices exist -- lets
+# tests exercise "not accessible" separately from "accessible, nothing
+# sealed yet".
+[ "${FAKE_TPM_ACCESSIBLE:-1}" = "1" ] && exit 0
+exit 1
+EOF
 cat > "$FAKEBIN/ssh-add" <<'EOF'
 #!/bin/sh
 # FAKE_SSH_ADD_EXIT: 0=identities present, 1=agent reachable but empty, 2=unreachable
@@ -52,7 +61,7 @@ case "$1" in
         ;;
 esac
 EOF
-chmod +x "$FAKEBIN/id" "$FAKEBIN/tpm2_nvreadpublic" "$FAKEBIN/ssh-add"
+chmod +x "$FAKEBIN/id" "$FAKEBIN/tpm2_nvreadpublic" "$FAKEBIN/tpm2_getcap" "$FAKEBIN/ssh-add"
 
 SNIPPET="$TMPDIR/status_block.sh"
 awk '/^if \[ "\$STATUS" -eq 1 \]; then/{found=1} found && /^# tpm2-tools.\x27 libtss2 backends/{exit} found{print}' "$REPO_ROOT/tpm_setup.sh" > "$SNIPPET"
@@ -96,6 +105,22 @@ else
     case "$OUT" in
         *"tpm2-tools not installed"*) pass "reports 'tpm2-tools not installed' cleanly, no crash" ;;
         *) fail "did not report tpm2-tools missing: $OUT" ;;
+    esac
+fi
+
+echo "=== tpm2-tools installed but TPM device not accessible (must not be confused with 'not installed') ==="
+OUT=$(run_case "$TMPDIR/home_c" FAKE_UID=6666 FAKE_TPM_ACCESSIBLE=0 FAKE_SSH_ADD_EXIT=2)
+CODE=$?
+if [ "$CODE" -ne 0 ]; then
+    fail "exited $CODE (set -e abort?) when the TPM device isn't accessible"
+else
+    case "$OUT" in
+        *"TPM secrets: unknown (TPM not accessible"*) pass "reports 'TPM not accessible' distinctly from 'not installed'" ;;
+        *) fail "did not distinguish inaccessible TPM from no-secrets-installed: $OUT" ;;
+    esac
+    case "$OUT" in
+        *"TPM secrets: not installed"*) fail "wrongly reported 'not installed' when the TPM itself couldn't be reached" ;;
+        *) pass "did not conflate an inaccessible TPM with 'not installed'" ;;
     esac
 fi
 
