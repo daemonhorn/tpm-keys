@@ -45,6 +45,17 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   `tpm2-tools` install onward assumes it's already there): covers running
   as root vs. needing `su`, and install success vs. failure, with fake
   `id`/`pkg`/`su` stubs so it doesn't touch the real system.
+- `test_uninstall.sh` / `.ps1` -- tests `--uninstall`/`-Uninstall`'s removal
+  of sealed TPM secrets and shell/profile integration. The `.sh` version
+  runs the real script end-to-end with fake
+  `id`/`tpm2_nvundefine` stubs on an isolated `PATH` (a fake, obviously-not-
+  real UID drives the computed NV index, so this can never touch a real
+  one), covering both confirmed and cancelled uninstalls, and that the
+  user's own unrelated dotfile content survives. The `.ps1` version tests
+  the parts that are pure text/logic (NV index formula, the `$PROFILE`
+  block-removal regex, that the elevation self-relaunch forwards `-Uninstall`
+  to the elevated child) since the full flow needs Windows-only
+  `WindowsPrincipal`/TBS access not available outside Windows.
 - `lib/extract.sh` -- pulls a single named function's source out of
   `tpm_setup.sh` so these tests exercise the real shipped code rather than
   a reimplementation that could drift out of sync with it.

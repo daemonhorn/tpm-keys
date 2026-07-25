@@ -26,10 +26,12 @@ run_suite "env file parser (sh)" sh "$SCRIPT_DIR/test_env_file_parser.sh"
 run_suite "tcsh alias regression" sh "$SCRIPT_DIR/test_tcsh_alias_bug.sh"
 run_suite "bash_profile bootstrap" sh "$SCRIPT_DIR/test_bash_profile_bootstrap.sh"
 run_suite "FreeBSD sudo bootstrap" sh "$SCRIPT_DIR/test_freebsd_sudo_bootstrap.sh"
+run_suite "uninstall (sh)" sh "$SCRIPT_DIR/test_uninstall.sh"
 
 if command -v pwsh >/dev/null 2>&1; then
     run_suite "sentinel header (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_sentinel_header.ps1"
     run_suite "env file parser (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_env_file_parser.ps1"
+    run_suite "uninstall (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_uninstall.ps1"
 else
     printf "\n=== PowerShell tests ===\nSKIP: pwsh not installed\n"
 fi

@@ -269,6 +269,28 @@ the other shell files). If something else already sources `~/.bashrc` too
 (another line in your own `~/.bash_profile`, for instance), that's harmless
 — the TPM block guards against running twice in the same shell.
 
+## Uninstalling
+
+```sh
+./tpm_setup.sh --uninstall
+```
+
+```powershell
+pwsh -File tpm_setup.ps1 -Uninstall
+```
+
+Removes this user's sealed secrets from TPM NV RAM and the `unlock_tpm`
+hooks from shell startup files (`~/.bashrc`, `~/.shrc`, `~/.cshrc`,
+`~/.bash_profile`, and the generated `~/.tpm_unlock.csh`/
+`~/.tpm_unlock_helper.sh` on Linux/FreeBSD; `$PROFILE` and the `~/.tpm_keys`
+helper directory on Windows) — asks for confirmation first, since this
+can't be undone. Your own unrelated content in those files is left alone.
+This does **not** delete your SSH private key file on disk, only the
+sealed copy in the TPM — back it up first if you haven't already, same as
+during setup. On Windows, this still needs an elevated PowerShell window,
+for the same reason seeding does (`NV_UndefineSpace` is blocked for
+non-admin processes).
+
 ## Re-running the script
 
 Running `tpm_setup.sh` again is safe:

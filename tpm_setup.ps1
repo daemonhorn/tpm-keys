@@ -22,7 +22,11 @@ param(
     # Optional: read the API key/value(s) to seal from a dotenv-style file
     # (NAME=VALUE per line) instead of the interactive Phase 2 prompt. See
     # Get-TpmEnvFileSecret below for the exact accepted format.
-    [string]$EnvFile
+    [string]$EnvFile,
+
+    # Remove this user's sealed secrets from the TPM and the unlock_tpm
+    # hook from $PROFILE, then exit -- skips the rest of setup entirely.
+    [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -530,7 +534,21 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         # shell is running under, so without it, an unsigned script here would
         # fail to load under a CurrentUser/LocalMachine policy of AllSigned or
         # Restricted even though the current, non-elevated invocation succeeded.
-        & $sudoCmd.Source $pwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
+        # Forward whatever named parameters this invocation was given (e.g.
+        # -EnvFile, -Uninstall) to the elevated child -- otherwise they'd be
+        # silently dropped and the relaunch would run a plain interactive
+        # setup instead of what was actually asked for.
+        $forwardArgs = @()
+        foreach ($paramName in $PSBoundParameters.Keys) {
+            $paramValue = $PSBoundParameters[$paramName]
+            if ($paramValue -is [switch]) {
+                if ($paramValue.IsPresent) { $forwardArgs += "-$paramName" }
+            } else {
+                $forwardArgs += "-$paramName"
+                $forwardArgs += $paramValue
+            }
+        }
+        & $sudoCmd.Source $pwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forwardArgs
         exit $LASTEXITCODE
     }
     Write-TpmLine "[TPM] ERROR: This script must be run from an elevated ('Run as administrator') PowerShell 7 window."
@@ -541,6 +559,75 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     Write-TpmLine "      Tip: enable Windows' built-in 'sudo' (Settings > System > For developers > Enable sudo) so"
     Write-TpmLine "      this script can self-elevate automatically next time."
     exit 1
+}
+
+if ($Uninstall) {
+    Write-TpmLine "`n=== Uninstall ==="
+    Write-TpmLine "To read/write the SAME TPM NV indices this was originally sealed under,"
+    Write-TpmLine "this needs the same UID you entered (or left blank) during setup."
+    $uidInput = Read-Host "Enter that UID (or press Enter to use this Windows session's own scheme)"
+    if ([string]::IsNullOrEmpty($uidInput)) {
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $rid = [int]($sid.Split('-')[-1]) % 1000000
+        $uid = $rid
+    } else {
+        $uid = [int]$uidInput
+    }
+    $ApiNvIndex = [uint32](22020096 + $uid * 2)
+    $SshNvIndex = [uint32](22020096 + $uid * 2 + 1)
+
+    Write-TpmLine "`nThis will:"
+    Write-TpmLine "  - Permanently delete the sealed API Key and SSH Key from TPM NV RAM"
+    Write-TpmLine "    (indices 0x$($ApiNvIndex.ToString('X')) / 0x$($SshNvIndex.ToString('X')))"
+    Write-TpmLine "  - Remove the unlock_tpm hook from `$PROFILE"
+    Write-TpmLine "  - Remove the `$HOME\.tpm_keys helper directory"
+    Write-TpmLine ""
+    Write-TpmLine "This does NOT delete your SSH private key file on disk -- only the sealed"
+    Write-TpmLine "copy in the TPM. This cannot be undone; make sure you have an offline"
+    Write-TpmLine "backup of your SSH key if you haven't already."
+    $uninstallConfirm = Read-Host "Continue? (y/n) [default: n]"
+    if ($uninstallConfirm -notmatch '^[Yy]') {
+        Write-TpmLine "[TPM] Aborting uninstall."
+        exit 0
+    }
+
+    $ctx = Connect-Tpm2
+    try {
+        try {
+            Remove-Tpm2NvIndex -Context $ctx -NvIndex $ApiNvIndex
+            Write-TpmLine "[TPM] Removed API Key NV index (0x$($ApiNvIndex.ToString('X')))."
+        } catch {
+            Write-TpmLine "[TPM] Note: could not remove API Key NV index (0x$($ApiNvIndex.ToString('X'))) -- it may already be gone: $_"
+        }
+        try {
+            Remove-Tpm2NvIndex -Context $ctx -NvIndex $SshNvIndex
+            Write-TpmLine "[TPM] Removed SSH Key NV index (0x$($SshNvIndex.ToString('X')))."
+        } catch {
+            Write-TpmLine "[TPM] Note: could not remove SSH Key NV index (0x$($SshNvIndex.ToString('X'))) -- it may already be gone: $_"
+        }
+    } finally {
+        Disconnect-Tpm2 -Context $ctx
+    }
+
+    $TpmHelperDir = Join-Path $HOME ".tpm_keys"
+    if (Test-Path $TpmHelperDir) {
+        Remove-Item -Recurse -Force $TpmHelperDir
+        Write-TpmLine "[TPM] Removed $TpmHelperDir"
+    }
+
+    if (Test-Path $PROFILE) {
+        $existing = Get-Content -Path $PROFILE -Raw -ErrorAction SilentlyContinue
+        if ($existing) {
+            $blockPattern = '(?s)\r?\n?# --- TPM Secure Environment Setup \(PowerShell\) ---.*?# ----------------------------------------------\r?\n?'
+            $newContent = [regex]::Replace($existing, $blockPattern, '')
+            Set-Content -Path $PROFILE -Value $newContent
+            Write-TpmLine "[TPM] Removed unlock_tpm hook from $PROFILE"
+        }
+    }
+
+    Write-TpmLine "`n=== Uninstall Complete ==="
+    Write-TpmLine "Restart PowerShell (or run '. `$PROFILE') for the change to take effect."
+    exit 0
 }
 
 # 2. ssh-agent service

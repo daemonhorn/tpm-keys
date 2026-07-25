@@ -7,6 +7,7 @@ set -e
 
 # --- CLI argument parsing ---
 ENV_FILE=""
+UNINSTALL=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --env-file)
@@ -21,11 +22,17 @@ while [ "$#" -gt 0 ]; do
             ENV_FILE="${1#--env-file=}"
             shift
             ;;
+        --uninstall)
+            UNINSTALL=1
+            shift
+            ;;
         -h | --help)
-            printf "Usage: %s [--env-file <path>]\n\n" "$0"
+            printf "Usage: %s [--env-file <path>] [--uninstall]\n\n" "$0"
             printf "%s\n" "  --env-file <path>  Read the API key/value(s) to seal from a dotenv-style"
             printf "%s\n" "                     file (NAME=VALUE per line) instead of the interactive"
             printf "%s\n" "                     Phase 2 prompt."
+            printf "%s\n" "  --uninstall        Remove this user's sealed secrets from the TPM and the"
+            printf "%s\n" "                     unlock_tpm hooks from shell startup files, then exit."
             exit 0
             ;;
         *)
@@ -37,6 +44,69 @@ done
 
 # $USER isn't guaranteed to be set (containers, cron, some su contexts).
 USER="${USER:-$(id -un)}"
+
+if [ "$UNINSTALL" -eq 1 ]; then
+    USER_UID=$(id -u)
+    API_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 )))
+    SSH_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 + 1 )))
+
+    printf "\n%s\n" "=== Uninstall ==="
+    printf "%s\n" "This will, for user $USER:"
+    printf "%s\n" "  - Permanently delete the sealed API Key and SSH Key from TPM NV RAM"
+    printf "%s\n" "    (indices $API_NV_INDEX / $SSH_NV_INDEX)"
+    printf "%s\n" "  - Remove the unlock_tpm hooks from ~/.bashrc, ~/.shrc, ~/.cshrc, and"
+    printf "%s\n" "    ~/.bash_profile"
+    printf "%s\n" "  - Remove ~/.tpm_unlock.csh, ~/.tpm_unlock_helper.sh, and ~/.tpm_keys_state"
+    printf "%s\n" ""
+    printf "%s\n" "This does NOT delete your SSH private key file on disk -- only the sealed"
+    printf "%s\n" "copy in the TPM. This cannot be undone; make sure you have an offline"
+    printf "%s\n" "backup of your SSH key if you haven't already."
+    printf "Continue? (y/n) [default: n]: "
+    read UNINSTALL_CONFIRM
+    case "$UNINSTALL_CONFIRM" in
+        [Yy]*) ;;
+        *)
+            printf "[TPM] Aborting uninstall.\n"
+            exit 0
+            ;;
+    esac
+
+    if command -v tpm2_nvundefine >/dev/null 2>&1; then
+        if tpm2_nvundefine -C o "$API_NV_INDEX" >/dev/null 2>&1; then
+            printf "[TPM] Removed API Key NV index (%s).\n" "$API_NV_INDEX"
+        else
+            printf "[TPM] Note: could not remove API Key NV index (%s) -- it may already be gone, or the TPM device isn't accessible.\n" "$API_NV_INDEX"
+        fi
+        if tpm2_nvundefine -C o "$SSH_NV_INDEX" >/dev/null 2>&1; then
+            printf "[TPM] Removed SSH Key NV index (%s).\n" "$SSH_NV_INDEX"
+        else
+            printf "[TPM] Note: could not remove SSH Key NV index (%s) -- it may already be gone, or the TPM device isn't accessible.\n" "$SSH_NV_INDEX"
+        fi
+    else
+        printf "[TPM] tpm2-tools not found; skipping TPM NV cleanup (nothing to remove locally).\n"
+    fi
+
+    for RC_FILE in "$HOME/.shrc" "$HOME/.bashrc"; do
+        if [ -f "$RC_FILE" ]; then
+            sed -i.bak '/# --- TPM Secure Environment Setup (sh\/bash) ---/,/# ----------------------------------------------/d' "$RC_FILE" 2>/dev/null || true
+            rm -f "$RC_FILE.bak"
+        fi
+    done
+    if [ -f "$HOME/.bash_profile" ]; then
+        sed -i.bak '/# --- TPM Secure Environment Setup (bash_profile bootstrap) ---/,/# ----------------------------------------------/d' "$HOME/.bash_profile" 2>/dev/null || true
+        rm -f "$HOME/.bash_profile.bak"
+    fi
+    if [ -f "$HOME/.cshrc" ]; then
+        sed -i.bak '/# --- TPM Secure Environment Setup (tcsh) ---/,/# -------------------------------------------/d' "$HOME/.cshrc" 2>/dev/null || true
+        rm -f "$HOME/.cshrc.bak"
+    fi
+    rm -f "$HOME/.tpm_unlock.csh" "$HOME/.tpm_unlock_helper.sh" "$HOME/.tpm_keys_state"
+    printf "[TPM] Removed unlock_tpm hooks from shell startup files.\n"
+
+    printf "\n%s\n" "=== Uninstall Complete ==="
+    printf "%s\n" "Log out and back in (or start a fresh shell) for the change to take effect."
+    exit 0
+fi
 
 # tpm2-tools' libtss2 backends log every TCTI probe attempt (device, swtpm,
 # mssim, ...) straight to stderr, which buries our own error messages under
