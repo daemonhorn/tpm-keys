@@ -82,6 +82,7 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
 |---|---|---|
 | `--env-file <path>`, `--env-file=<path>` | `-EnvFile <path>` | Seed from a dotenv-style file instead of the interactive prompt — see [Loading secrets from a file](#loading-secrets-from-a-file---env-file). |
 | `--uninstall` | `-Uninstall` | Remove this user's sealed secrets and shell/profile hooks, then exit — see [Uninstalling](#uninstalling). |
+| `--status` | `-Status` | Print a summary of the current state and exit — makes no changes — see [Checking status](#checking-status). |
 | `-h`, `--help` | `-h`, `-Help` | Print usage and exit. |
 
 ## What the script does
@@ -310,6 +311,39 @@ during setup. On Windows, this still needs an elevated PowerShell window,
 for the same reason seeding does (`NV_UndefineSpace` is blocked for
 non-admin processes).
 
+## Checking status
+
+```sh
+./tpm_setup.sh --status
+```
+
+```powershell
+pwsh -File tpm_setup.ps1 -Status
+```
+
+Prints a succinct, one-item-per-line summary of the current state and exits
+— makes no changes, installs nothing, and never prompts to seed or generate
+anything:
+
+- Effective user and UID (`id -u` on Linux/FreeBSD; the UID you enter, or
+  the one derived from your Windows SID, on Windows) — this is what
+  determines which TPM NV indices are checked.
+- Whether TPM secrets are installed at those NV indices, not installed, or
+  only partially (e.g. the API key was sealed but the SSH key wasn't).
+- Whether `~/.ssh/id_ed25519` is present on disk.
+- Whether an ED25519 identity is currently loaded in ssh-agent (unlocked)
+  or not (locked).
+- How many environment secrets are loaded, out of how many were sealed
+  (e.g. `2/2 loaded`), including legacy single-key installs and older
+  installs that predate name tracking (reported honestly as unknown rather
+  than guessed).
+- Whether ssh-agent is running, and if so, the public key material of every
+  loaded identity (via `ssh-add -L`) — never the private key.
+
+A plain NV read needs no PIN and no admin rights, so `--status`/`-Status`
+runs without asking for your Master PIN and, on Windows, without triggering
+the elevation relaunch that seeding and uninstalling need.
+
 ## Re-running the script
 
 Running `tpm_setup.sh` again is safe:
@@ -345,9 +379,10 @@ so this doesn't affect dual-boot sharing.
 ## Testing
 
 `tests/` covers both scripts: the on-TPM header format, the `--env-file`
-parser, `--uninstall`, and regressions for the tcsh alias, bash-login-shell,
-and FreeBSD `sudo`-bootstrap bugs described above. Run `./tests/run_all.sh`;
-see `tests/README.md` for what each suite covers and its prerequisites.
+parser, `--uninstall`, `--status`, and regressions for the tcsh alias,
+bash-login-shell, and FreeBSD `sudo`-bootstrap bugs described above. Run
+`./tests/run_all.sh`; see `tests/README.md` for what each suite covers and
+its prerequisites.
 
 ## Security notes
 

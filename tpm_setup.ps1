@@ -28,6 +28,10 @@ param(
     # hook from $PROFILE, then exit -- skips the rest of setup entirely.
     [switch]$Uninstall,
 
+    # Print a read-only summary of the current state and exit -- makes no
+    # changes (no install, no seeding, no elevation).
+    [switch]$Status,
+
     # Print usage and exit.
     [Alias('h')]
     [switch]$Help
@@ -44,13 +48,15 @@ if ($Help) {
     Write-TpmLine "writes the same TPM NV RAM indices as tpm_setup.sh, so a dual-booted machine"
     Write-TpmLine "can seal a secret in one OS and unlock it in the other."
     Write-TpmLine ""
-    Write-TpmLine "Usage: pwsh -File tpm_setup.ps1 [-EnvFile <path>] [-Uninstall] [-Help]"
+    Write-TpmLine "Usage: pwsh -File tpm_setup.ps1 [-EnvFile <path>] [-Uninstall] [-Status] [-Help]"
     Write-TpmLine ""
     Write-TpmLine "  -EnvFile <path>  Read the API key/value(s) to seal from a dotenv-style file"
     Write-TpmLine "                   (NAME=VALUE per line) instead of the interactive Phase 2"
     Write-TpmLine "                   prompt."
     Write-TpmLine "  -Uninstall       Remove this user's sealed secrets from the TPM and the"
     Write-TpmLine "                   unlock_tpm hook from `$PROFILE, then exit."
+    Write-TpmLine "  -Status          Print a summary of the current state (installed,"
+    Write-TpmLine "                   locked/unlocked, ssh-agent) and exit -- makes no changes."
     Write-TpmLine "  -Help, -h        Show this help and exit."
     exit 0
 }
@@ -529,6 +535,117 @@ try {
     exit 1
 }
 
+if ($Status) {
+    # A plain NV_ReadPublic needs no PIN and no admin rights, so -Status
+    # runs entirely before the elevation check below -- deliberately does
+    # NOT install anything, start the ssh-agent service, or seed a secret.
+    Write-TpmLine "`nTo read the SAME TPM NV indices as when this was sealed, this needs the"
+    Write-TpmLine "same UID you entered (or left blank) during setup."
+    $uidInput = Read-Host "Enter that UID (or press Enter to use this Windows session's own scheme)"
+    if ([string]::IsNullOrEmpty($uidInput)) {
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $rid = [int]($sid.Split('-')[-1]) % 1000000
+        $uid = $rid
+    } else {
+        $uid = [int]$uidInput
+    }
+    $ApiNvIndex = [uint32](22020096 + $uid * 2)
+    $SshNvIndex = [uint32](22020096 + $uid * 2 + 1)
+
+    Write-TpmLine "`n=== TPM Status ==="
+    Write-TpmLine "User: $([Environment]::UserName) (uid $uid)"
+
+    $apiInstalled = $false
+    $sshInstalled = $false
+    $statusCtx = Connect-Tpm2
+    try {
+        $apiInstalled = (Get-Tpm2NvPublic -Context $statusCtx -NvIndex $ApiNvIndex).Exists
+        $sshInstalled = (Get-Tpm2NvPublic -Context $statusCtx -NvIndex $SshNvIndex).Exists
+    } finally {
+        Disconnect-Tpm2 -Context $statusCtx
+    }
+    if ($apiInstalled -and $sshInstalled) {
+        Write-TpmLine "TPM secrets: installed (API 0x$($ApiNvIndex.ToString('X')), SSH 0x$($SshNvIndex.ToString('X')))"
+    } elseif (-not $apiInstalled -and -not $sshInstalled) {
+        Write-TpmLine "TPM secrets: not installed"
+    } else {
+        $apiState = if ($apiInstalled) { 'present' } else { 'missing' }
+        $sshState = if ($sshInstalled) { 'present' } else { 'missing' }
+        Write-TpmLine "TPM secrets: partially installed (API $apiState, SSH $sshState)"
+    }
+
+    $sshKeyPath = Join-Path (Join-Path $HOME ".ssh") "id_ed25519"
+    if (Test-Path $sshKeyPath) {
+        Write-TpmLine "SSH key file (${sshKeyPath}): present"
+    } else {
+        Write-TpmLine "SSH key file (${sshKeyPath}): missing"
+    }
+
+    $agentAvailable = [bool](Get-Command ssh-add -ErrorAction SilentlyContinue)
+    $agentIdentities = $null
+    if ($agentAvailable) {
+        $agentIdentities = & ssh-add -l 2>$null
+    }
+    $agentHasEd25519 = $agentIdentities -and (($agentIdentities -join "`n") -match 'ED25519')
+    if ($agentHasEd25519) {
+        Write-TpmLine "SSH key: unlocked (ED25519 identity loaded in ssh-agent)"
+    } else {
+        Write-TpmLine "SSH key: locked (no ED25519 identity loaded in ssh-agent)"
+    }
+
+    # Environment secret count: Phase 4 persists which NAME="value" names
+    # (if any) it sealed to secret_names.txt purely so this can report an
+    # accurate count without unsealing anything; an install predating that
+    # (or a fresh, never-seeded account) has no such file.
+    $namesFile = Join-Path (Join-Path $HOME ".tpm_keys") "secret_names.txt"
+    if (Test-Path $namesFile) {
+        $secretNames = (Get-Content -Path $namesFile -Raw -ErrorAction SilentlyContinue)
+        if ($null -eq $secretNames) { $secretNames = "" }
+        $secretNames = $secretNames.Trim()
+        if ([string]::IsNullOrEmpty($secretNames)) {
+            if ($env:SECURE_API_KEY) {
+                Write-TpmLine "API secret(s): unlocked (1/1 loaded: SECURE_API_KEY)"
+            } else {
+                Write-TpmLine "API secret(s): locked (0/1 loaded)"
+            }
+        } else {
+            $names = $secretNames -split ' ' | Where-Object { $_ }
+            $loaded = @($names | Where-Object { [Environment]::GetEnvironmentVariable($_) })
+            if ($loaded.Count -eq 0) {
+                Write-TpmLine "API secret(s): locked (0/$($names.Count) loaded)"
+            } elseif ($loaded.Count -eq $names.Count) {
+                Write-TpmLine "API secret(s): unlocked ($($loaded.Count)/$($names.Count) loaded: $($loaded -join ' '))"
+            } else {
+                Write-TpmLine "API secret(s): partially unlocked ($($loaded.Count)/$($names.Count) loaded: $($loaded -join ' '))"
+            }
+        }
+    } else {
+        if ($env:SECURE_API_KEY) {
+            Write-TpmLine "API secret(s): unlocked (legacy `$env:SECURE_API_KEY loaded)"
+        } else {
+            Write-TpmLine "API secret(s): unknown (older install predates name tracking, or nothing sealed yet)"
+        }
+    }
+
+    $sshAgentSvcStatus = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
+    if (-not $sshAgentSvcStatus) {
+        Write-TpmLine "ssh-agent: not installed (OpenSSH Client Windows feature missing)"
+    } elseif ($sshAgentSvcStatus.Status -ne 'Running') {
+        Write-TpmLine "ssh-agent: not running (service status: $($sshAgentSvcStatus.Status))"
+    } else {
+        Write-TpmLine "ssh-agent: running"
+        if ($agentHasEd25519) {
+            $pubKeys = & ssh-add -L 2>$null
+            Write-TpmLine "Loaded identities:"
+            foreach ($line in $pubKeys) { Write-TpmLine "  $line" }
+        } else {
+            Write-TpmLine "Loaded identities: none"
+        }
+    }
+
+    exit 0
+}
+
 # Windows TBS enforces its own allow-list of TPM 2.0 command ordinals, separate
 # from the TPM's owner-hierarchy auth, and that list differs for standard-user
 # vs. administrator processes. NV_DefineSpace/NV_UndefineSpace (Phase 4, this
@@ -980,6 +1097,11 @@ try {
         Write-TpmLine "Writing API Key to TPM (0x$($ApiNvIndex.ToString('X')))..."
         New-Tpm2NvIndex -Context $ctx -NvIndex $ApiNvIndex -Size $ApiNvSize -Pin $apiNvAuth
         Write-Tpm2Nv -Context $ctx -NvIndex $ApiNvIndex -Data ([System.Text.Encoding]::UTF8.GetBytes($apiKeyInput)) -Pin $apiNvAuth
+        # Persist which NAME="value" variables (if any) this sealed, purely
+        # so -Status can later report an accurate environment-secret count
+        # without needing to unseal anything -- empty file means legacy
+        # single $env:SECURE_API_KEY mode.
+        Set-Content -Path (Join-Path $TpmHelperDir "secret_names.txt") -Value ($report.Names -join ' ') -NoNewline
 
         Write-TpmLine "Writing SSH Key to TPM (0x$($SshNvIndex.ToString('X')))..."
         New-Tpm2NvIndex -Context $ctx -NvIndex $SshNvIndex -Size $SshNvSize -Pin $masterPin

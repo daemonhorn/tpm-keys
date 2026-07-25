@@ -8,6 +8,7 @@ set -e
 # --- CLI argument parsing ---
 ENV_FILE=""
 UNINSTALL=0
+STATUS=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --env-file)
@@ -26,6 +27,10 @@ while [ "$#" -gt 0 ]; do
             UNINSTALL=1
             shift
             ;;
+        --status)
+            STATUS=1
+            shift
+            ;;
         -h | --help)
             printf "%s\n" "Seals your SSH key and API key/token secrets inside this machine's TPM 2.0,"
             printf "%s\n" "protected by one Master PIN, and wires up automatic (or on-demand) unlocking"
@@ -33,12 +38,15 @@ while [ "$#" -gt 0 ]; do
             printf "%s\n" "Reads/writes the same TPM NV RAM indices as tpm_setup.ps1, so a dual-booted"
             printf "%s\n" "machine can seal a secret in one OS and unlock it in the other."
             printf "\n"
-            printf "Usage: %s [--env-file <path>] [--uninstall]\n\n" "$0"
+            printf "Usage: %s [--env-file <path>] [--uninstall] [--status]\n\n" "$0"
             printf "%s\n" "  --env-file <path>  Read the API key/value(s) to seal from a dotenv-style"
             printf "%s\n" "                     file (NAME=VALUE per line) instead of the interactive"
             printf "%s\n" "                     Phase 2 prompt."
             printf "%s\n" "  --uninstall        Remove this user's sealed secrets from the TPM and the"
             printf "%s\n" "                     unlock_tpm hooks from shell startup files, then exit."
+            printf "%s\n" "  --status           Print a summary of the current state (installed,"
+            printf "%s\n" "                     locked/unlocked, ssh-agent) and exit -- makes no"
+            printf "%s\n" "                     changes."
             exit 0
             ;;
         *)
@@ -111,6 +119,142 @@ if [ "$UNINSTALL" -eq 1 ]; then
 
     printf "\n%s\n" "=== Uninstall Complete ==="
     printf "%s\n" "Log out and back in (or start a fresh shell) for the change to take effect."
+    exit 0
+fi
+
+if [ "$STATUS" -eq 1 ]; then
+    USER_UID=$(id -u)
+    API_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 )))
+    SSH_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 + 1 )))
+    SSH_KEY_PATH="$HOME/.ssh/id_ed25519"
+    STATE_FILE="$HOME/.tpm_keys_state"
+    # Distinguishes "never persisted" (older install, predates name
+    # tracking) from "persisted as empty" (legacy single-key mode was
+    # chosen) -- both look like an empty string otherwise.
+    SECRET_NAMES="__UNTRACKED__"
+    [ -f "$STATE_FILE" ] && . "$STATE_FILE"
+
+    printf "%s\n" "=== TPM Status ==="
+    printf "User: %s (uid %s)\n" "$USER" "$USER_UID"
+
+    # --- Installed? A plain NV_ReadPublic needs no PIN, so this is safe
+    # and side-effect-free; deliberately does NOT try to install
+    # tpm2-tools or fix group/device access the way normal setup would.
+    API_INSTALLED=0
+    SSH_INSTALLED=0
+    if command -v tpm2_nvreadpublic >/dev/null 2>&1; then
+        tpm2_nvreadpublic "$API_NV_INDEX" >/dev/null 2>&1 && API_INSTALLED=1
+        tpm2_nvreadpublic "$SSH_NV_INDEX" >/dev/null 2>&1 && SSH_INSTALLED=1
+        if [ "$API_INSTALLED" -eq 1 ] && [ "$SSH_INSTALLED" -eq 1 ]; then
+            printf "TPM secrets: installed (API %s, SSH %s)\n" "$API_NV_INDEX" "$SSH_NV_INDEX"
+        elif [ "$API_INSTALLED" -eq 0 ] && [ "$SSH_INSTALLED" -eq 0 ]; then
+            printf "TPM secrets: not installed (or TPM device not accessible)\n"
+        else
+            printf "TPM secrets: partially installed (API %s, SSH %s)\n" \
+                "$( [ "$API_INSTALLED" -eq 1 ] && printf present || printf missing )" \
+                "$( [ "$SSH_INSTALLED" -eq 1 ] && printf present || printf missing )"
+        fi
+    else
+        printf "TPM secrets: unknown (tpm2-tools not installed)\n"
+    fi
+
+    if [ -f "$SSH_KEY_PATH" ]; then
+        printf "SSH key file (%s): present\n" "$SSH_KEY_PATH"
+    else
+        printf "SSH key file (%s): missing\n" "$SSH_KEY_PATH"
+    fi
+
+    AGENT_HAS_ED25519=0
+    if [ -n "$SSH_AUTH_SOCK" ] && ssh-add -l >/dev/null 2>&1; then
+        if ssh-add -l 2>/dev/null | grep -q "ED25519"; then
+            AGENT_HAS_ED25519=1
+        fi
+    fi
+    if [ "$AGENT_HAS_ED25519" -eq 1 ]; then
+        printf "SSH key: unlocked (ED25519 identity loaded in ssh-agent)\n"
+    else
+        printf "SSH key: locked (no ED25519 identity loaded in ssh-agent)\n"
+    fi
+
+    # --- Environment secret(s): count depends on whether Phase 4 recorded
+    # NAME="value" secret names (SECRET_NAMES) or this used the legacy
+    # single opaque $SECURE_API_KEY -- see the three-way distinction above.
+    if [ "$SECRET_NAMES" = "__UNTRACKED__" ]; then
+        if [ -n "$SECURE_API_KEY" ]; then
+            printf "API secret(s): unlocked (legacy \$SECURE_API_KEY loaded)\n"
+        else
+            printf "API secret(s): unknown (older install predates name tracking; re-seed to enable this)\n"
+        fi
+    elif [ -z "$SECRET_NAMES" ]; then
+        if [ -n "$SECURE_API_KEY" ]; then
+            printf "API secret(s): unlocked (1/1 loaded: SECURE_API_KEY)\n"
+        else
+            printf "API secret(s): locked (0/1 loaded)\n"
+        fi
+    else
+        LOADED_COUNT=0
+        TOTAL_COUNT=0
+        LOADED_LIST=""
+        OLD_IFS="$IFS"
+        IFS=" "
+        for SECRET_NAME in $SECRET_NAMES; do
+            TOTAL_COUNT=$((TOTAL_COUNT + 1))
+            eval "SECRET_VAL=\"\${$SECRET_NAME:-}\""
+            if [ -n "$SECRET_VAL" ]; then
+                LOADED_COUNT=$((LOADED_COUNT + 1))
+                LOADED_LIST="$LOADED_LIST $SECRET_NAME"
+            fi
+        done
+        IFS="$OLD_IFS"
+        if [ "$LOADED_COUNT" -eq 0 ]; then
+            printf "API secret(s): locked (0/%s loaded)\n" "$TOTAL_COUNT"
+        elif [ "$LOADED_COUNT" -eq "$TOTAL_COUNT" ]; then
+            printf "API secret(s): unlocked (%s/%s loaded:%s)\n" "$LOADED_COUNT" "$TOTAL_COUNT" "$LOADED_LIST"
+        else
+            printf "API secret(s): partially unlocked (%s/%s loaded:%s)\n" "$LOADED_COUNT" "$TOTAL_COUNT" "$LOADED_LIST"
+        fi
+    fi
+
+    if [ -z "$SSH_AUTH_SOCK" ]; then
+        printf "ssh-agent: not running\n"
+    else
+        # ssh-add -l exit codes: 0 = identities listed, 1 = agent reachable
+        # but empty, 2 = couldn't connect (stale/dead socket) -- only 2
+        # means the agent itself isn't actually reachable. Captured via
+        # if/else (not a bare command + trailing $?) since this runs under
+        # `set -e`, which would otherwise abort the whole script the
+        # moment ssh-add exits non-zero.
+        if ssh-add -l >/dev/null 2>&1; then
+            SSH_ADD_STATUS=0
+        else
+            SSH_ADD_STATUS=$?
+        fi
+        if [ "$SSH_ADD_STATUS" -eq 2 ]; then
+            printf "ssh-agent: not reachable (\$SSH_AUTH_SOCK is set but stale)\n"
+        else
+            printf "ssh-agent: running (%s)\n" "$SSH_AUTH_SOCK"
+            # Only ask for public keys when $SSH_ADD_STATUS (from -l above)
+            # already confirmed identities exist -- ssh-add -L's own exit
+            # code and stdout are indistinguishable between "no identities"
+            # and "identities present" without this (both print a message
+            # to stdout and exit non-zero for the empty case), and calling
+            # it unconditionally would be another set -e hazard besides.
+            if [ "$SSH_ADD_STATUS" -eq 0 ]; then
+                AGENT_PUBKEYS=$(ssh-add -L 2>/dev/null || true)
+            else
+                AGENT_PUBKEYS=""
+            fi
+            if [ -n "$AGENT_PUBKEYS" ]; then
+                printf "Loaded identities:\n"
+                printf "%s\n" "$AGENT_PUBKEYS" | while IFS= read -r PUBLINE; do
+                    printf "  %s\n" "$PUBLINE"
+                done
+            else
+                printf "Loaded identities: none\n"
+            fi
+        fi
+    fi
+
     exit 0
 fi
 
@@ -880,7 +1024,8 @@ if [ "$API_AUTH_MODE" = "agent" ]; then
     fi
     unset DERIVED_API_PIN
 fi
-printf "API_AUTH_MODE=%s\nSSH_AGENT_AUTOSTART=%s\n" "$API_AUTH_MODE" "$SSH_AGENT_AUTOSTART" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+TRIMMED_NAMES=$(_tpm_trim "$NAMES")
+printf 'API_AUTH_MODE=%s\nSSH_AGENT_AUTOSTART=%s\nSECRET_NAMES="%s"\n' "$API_AUTH_MODE" "$SSH_AGENT_AUTOSTART" "$TRIMMED_NAMES" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
 
 printf "Writing API Key to TPM (%s)...\n" "$API_NV_INDEX"
 if ! tpm2_nvdefine -C o -s "$API_NV_SIZE" -a "authread|authwrite" -p "$API_NV_AUTH" "$API_NV_INDEX"; then

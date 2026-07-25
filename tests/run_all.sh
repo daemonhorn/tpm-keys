@@ -29,11 +29,13 @@ run_suite "FreeBSD sudo bootstrap" sh "$SCRIPT_DIR/test_freebsd_sudo_bootstrap.s
 run_suite "uninstall (sh)" sh "$SCRIPT_DIR/test_uninstall.sh"
 run_suite "--help usage text" sh "$SCRIPT_DIR/test_help.sh"
 run_suite "ssh-agent key check" sh "$SCRIPT_DIR/test_ssh_agent_key_check.sh"
+run_suite "--status (sh)" sh "$SCRIPT_DIR/test_status.sh"
 
 if command -v pwsh >/dev/null 2>&1; then
     run_suite "sentinel header (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_sentinel_header.ps1"
     run_suite "env file parser (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_env_file_parser.ps1"
     run_suite "uninstall (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_uninstall.ps1"
+    run_suite "-Status (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_status.ps1"
 else
     printf "\n=== PowerShell tests ===\nSKIP: pwsh not installed\n"
 fi

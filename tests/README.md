@@ -70,6 +70,23 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   waiting to happen. Confirms both scripts now print a clear note in that
   case, and don't when the agent has nothing loaded, using fake
   `ssh-add`/`ssh-keygen` stubs against the real extracted code.
+- `test_status.sh` / `.ps1` -- tests `--status`/`-Status`, the read-only
+  summary of installed/locked/unlocked state, effective UID, `~/.ssh/id_ed25519`
+  presence, environment secret count, and ssh-agent/loaded-identity state
+  (including public key material). Covers not-installed, fully-installed
+  and unlocked, partially loaded named secrets with an agent reachable but
+  empty, legacy single-key mode, and an older install that predates name
+  tracking. The `.sh` version runs the real extracted block under `sh -e`
+  (matching the real script's `set -e`) with fake `id`/`tpm2_nvreadpublic`/
+  `ssh-add` stubs on an isolated `PATH`, specifically to catch the class of
+  bug where capturing a failing command's exit code aborts the whole
+  script under `set -e` before the assignment runs. The `.ps1` version runs
+  the real extracted block in a background job (`Start-Job`/`Receive-Job`)
+  with `Connect-Tpm2`/`Get-Tpm2NvPublic`/`ssh-add`/`Get-Service` mocked as
+  literal text embedded in the same scriptblock -- the block ends with
+  `exit 0`, which running it directly in-process would take the whole test
+  runner down with it (confirmed by reproducing that exact failure during
+  development), and a job isolates `exit` to its own child process.
 - `lib/extract.sh` -- pulls a single named function's source out of
   `tpm_setup.sh` so these tests exercise the real shipped code rather than
   a reimplementation that could drift out of sync with it.
