@@ -27,7 +27,9 @@ key into `ssh-agent` and the API key(s) into your environment.
 - A TPM 2.0 chip (discrete, firmware/fTPM, or Intel PTT), **enabled in
   BIOS/UEFI**.
 - `sudo` access (the script installs packages, loads kernel modules, and
-  manages group membership on your behalf).
+  manages group membership on your behalf) — or, on FreeBSD, at least root
+  access via `su`, since the script can install `sudo` itself if it's
+  missing (see [FreeBSD](#freebsd) below).
 - An interactive terminal (the script prompts for input and disables echo
   while you type the PIN).
 
@@ -77,8 +79,10 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
 ## What the script does
 
 1. **Phase 1 — OS detection & prerequisites**: detects your distro,
-   installs `tpm2-tools` if missing, loads the TPM kernel module if the
-   device node is absent, and adds you to the `tss`/`_tss` group.
+   installs `sudo` first if it's missing (FreeBSD only — see
+   [FreeBSD](#freebsd) above), installs `tpm2-tools` if missing, loads the
+   TPM kernel module if the device node is absent, and adds you to the
+   `tss`/`_tss` group.
    - If your group membership just changed, the script exits and asks you
      to **log out and back in**, then re-run it — group membership doesn't
      take effect in your current session.
@@ -100,6 +104,9 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
    replaces the old block cleanly rather than duplicating it). Also ensures
    `~/.bash_profile` sources `~/.bashrc` — see
    [bash as a login shell](#bash-as-a-login-shell) below for why.
+
+To remove everything this installs instead, see
+[Uninstalling](#uninstalling).
 
 ## Usage examples
 
@@ -325,9 +332,10 @@ so this doesn't affect dual-boot sharing.
 
 ## Testing
 
-`tests/` has a small suite covering the on-TPM header format, the
-`--env-file` parser, and a tcsh alias regression, for both scripts. Run
-`./tests/run_all.sh`; see `tests/README.md` for details and prerequisites.
+`tests/` covers both scripts: the on-TPM header format, the `--env-file`
+parser, `--uninstall`, and regressions for the tcsh alias, bash-login-shell,
+and FreeBSD `sudo`-bootstrap bugs described above. Run `./tests/run_all.sh`;
+see `tests/README.md` for what each suite covers and its prerequisites.
 
 ## Security notes
 
@@ -399,8 +407,9 @@ relaunch.
   - Otherwise, it exits with instructions to re-run from an elevated
     ("Run as administrator") PowerShell 7 window yourself.
 
-  Either way, elevation is only needed for this initial run — `unlock_tpm`
-  and everyday use never require it.
+  Either way, elevation is only needed for this initial run (and for
+  [`-Uninstall`](#uninstalling), which removes the same NV indices) —
+  `unlock_tpm` and everyday use never require it.
 - **Execution policy**: `tpm_setup.ps1` is unsigned, so your effective
   `Get-ExecutionPolicy` can't be `AllSigned` or `Restricted`, or PowerShell
   will refuse to run it at all. `RemoteSigned` (the common default) is
