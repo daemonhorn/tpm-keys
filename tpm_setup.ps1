@@ -18,6 +18,13 @@ from the standard-user list. Run this script itself elevated; day-to-day
 use afterwards (unlock_tpm) does not need elevation.
 #>
 
+param(
+    # Optional: read the API key/value(s) to seal from a dotenv-style file
+    # (NAME=VALUE per line) instead of the interactive Phase 2 prompt. See
+    # Get-TpmEnvFileSecret below for the exact accepted format.
+    [string]$EnvFile
+)
+
 $ErrorActionPreference = 'Stop'
 
 function Write-TpmLine { param([string]$Text) Write-Host $Text }
@@ -59,6 +66,23 @@ $script:TPM_CAP_TPM_PROPERTIES = 0x00000006
 $script:TPM_PT_NV_BUFFER_MAX   = 0x0000012C
 $script:TPMA_NV_AUTHWRITE    = 0x00000004
 $script:TPMA_NV_AUTHREAD     = 0x00040000
+
+# On-TPM wire format: Write-Tpm2Nv prepends this 6-byte header (2-byte
+# magic + a 4-digit zero-padded ASCII decimal length) to every payload, so
+# Read-Tpm2Nv can pull back exactly the real payload instead of the TPM's
+# erase-fill garbage padding out the rest of the fixed-size NV region
+# (0x00 on some TPMs, 0xFF on others -- verified on FreeBSD). Shared with
+# tpm_setup.sh's _tpm_emit_header/_tpm_read_secret, which use the same
+# magic bytes and layout, so a secret sealed on one OS unlocks correctly on
+# the other. The length is ASCII decimal, not raw binary, because real
+# testing found that `printf '%b'` on FreeBSD's native /bin/sh truncates
+# its output at the first embedded NUL byte -- which a binary length's
+# high byte is for any payload under 256 bytes (virtually always). This
+# side has no such constraint, but the wire format must match tpm_setup.sh
+# byte-for-byte for dual-boot secrets to unlock on both.
+$script:TPM_HDR_MAGIC1 = 0xA5
+$script:TPM_HDR_MAGIC2 = 0x7E
+$script:TPM_HDR_SIZE   = 6
 
 $script:TPM_CC_NV_UndefineSpace = 0x00000122
 $script:TPM_CC_NV_DefineSpace   = 0x0000012A
@@ -276,10 +300,13 @@ function Write-Tpm2Nv {
     $pinBytes = [System.Text.Encoding]::UTF8.GetBytes($Pin)
     $chunkMax = Get-Tpm2NvBufferMax -Context $Context
     [byte[]]$handles = (ConvertTo-BE32 $NvIndex) + (ConvertTo-BE32 $NvIndex)
+    [byte[]]$lenDigits = [System.Text.Encoding]::ASCII.GetBytes($Data.Length.ToString('D4'))
+    [byte[]]$header = @([byte]$script:TPM_HDR_MAGIC1, [byte]$script:TPM_HDR_MAGIC2) + $lenDigits
+    [byte[]]$payload = $header + $Data
     $offset = 0
-    while ($offset -lt $Data.Length) {
-        $len = [Math]::Min($chunkMax, $Data.Length - $offset)
-        [byte[]]$chunk = $Data[$offset..($offset + $len - 1)]
+    while ($offset -lt $payload.Length) {
+        $len = [Math]::Min($chunkMax, $payload.Length - $offset)
+        [byte[]]$chunk = $payload[$offset..($offset + $len - 1)]
         $authArea = New-Tpm2PwapSession -Password $pinBytes
         [byte[]]$params = (New-Tpm2B $chunk) + (ConvertTo-BE16 $offset)
         $cmd = Build-Tpm2Command -Tag $script:TPM_ST_SESSIONS -CommandCode $script:TPM_CC_NV_Write -Handles $handles -AuthArea $authArea -Params $params
@@ -287,6 +314,34 @@ function Write-Tpm2Nv {
         Assert-Tpm2Success -Result $res -Operation "NV_Write(0x$($NvIndex.ToString('X')), offset=$offset)"
         $offset += $len
     }
+}
+
+function Read-Tpm2NvRange {
+    param(
+        [Parameter(Mandatory)][IntPtr]$Context,
+        [Parameter(Mandatory)][uint32]$NvIndex,
+        [Parameter(Mandatory)][byte[]]$PinBytes,
+        [Parameter(Mandatory)][int]$Start,
+        [Parameter(Mandatory)][int]$Length,
+        [Parameter(Mandatory)][int]$ChunkMax
+    )
+    [byte[]]$handles = (ConvertTo-BE32 $NvIndex) + (ConvertTo-BE32 $NvIndex)
+    [byte[]]$out = @()
+    $offset = $Start
+    $end = $Start + $Length
+    while ($offset -lt $end) {
+        $len = [Math]::Min($ChunkMax, $end - $offset)
+        $authArea = New-Tpm2PwapSession -Password $PinBytes
+        [byte[]]$params = (ConvertTo-BE16 $len) + (ConvertTo-BE16 $offset)
+        $cmd = Build-Tpm2Command -Tag $script:TPM_ST_SESSIONS -CommandCode $script:TPM_CC_NV_Read -Handles $handles -AuthArea $authArea -Params $params
+        $res = Invoke-Tpm2RawCommand -Context $Context -Command $cmd
+        Assert-Tpm2Success -Result $res -Operation "NV_Read(0x$($NvIndex.ToString('X')), offset=$offset)"
+        $b = $res.Bytes
+        $dataLen = ConvertFrom-BE16 $b 14
+        if ($dataLen -gt 0) { $out += $b[16..(16 + $dataLen - 1)] }
+        $offset += $len
+    }
+    ,$out
 }
 
 function Read-Tpm2Nv {
@@ -299,23 +354,28 @@ function Read-Tpm2Nv {
     if (-not $pub.Exists) { throw [Tpm2Exception]::new("NV index 0x$($NvIndex.ToString('X')) does not exist", $script:TPM_RC_HANDLE) }
     $pinBytes = [System.Text.Encoding]::UTF8.GetBytes($Pin)
     $chunkMax = Get-Tpm2NvBufferMax -Context $Context
-    [byte[]]$handles = (ConvertTo-BE32 $NvIndex) + (ConvertTo-BE32 $NvIndex)
-    [byte[]]$out = @()
-    $offset = 0
-    $total = $pub.DataSize
-    while ($offset -lt $total) {
-        $len = [Math]::Min($chunkMax, $total - $offset)
-        $authArea = New-Tpm2PwapSession -Password $pinBytes
-        [byte[]]$params = (ConvertTo-BE16 $len) + (ConvertTo-BE16 $offset)
-        $cmd = Build-Tpm2Command -Tag $script:TPM_ST_SESSIONS -CommandCode $script:TPM_CC_NV_Read -Handles $handles -AuthArea $authArea -Params $params
-        $res = Invoke-Tpm2RawCommand -Context $Context -Command $cmd
-        Assert-Tpm2Success -Result $res -Operation "NV_Read(0x$($NvIndex.ToString('X')), offset=$offset)"
-        $b = $res.Bytes
-        $dataLen = ConvertFrom-BE16 $b 14
-        if ($dataLen -gt 0) { $out += $b[16..(16 + $dataLen - 1)] }
-        $offset += $len
+
+    # On-TPM wire format: a 6-byte header (2-byte magic + a 4-digit
+    # zero-padded ASCII decimal length), written by Write-Tpm2Nv, records
+    # exactly how many payload bytes follow -- so a read never has to guess
+    # where real data ends and the TPM's erase-fill garbage begins (0x00 on
+    # some TPMs, 0xFF on others). Data sealed before this header existed
+    # has no magic; fall back to a full-region read with trailing
+    # 0x00/0xFF stripped for that.
+    if ($pub.DataSize -ge $script:TPM_HDR_SIZE) {
+        $hdr = Read-Tpm2NvRange -Context $Context -NvIndex $NvIndex -PinBytes $pinBytes -Start 0 -Length $script:TPM_HDR_SIZE -ChunkMax $chunkMax
+        $digitsOk = ($hdr.Length -eq $script:TPM_HDR_SIZE) -and ($hdr[2..5] | Where-Object { $_ -lt 0x30 -or $_ -gt 0x39 } | Measure-Object).Count -eq 0
+        if ($digitsOk -and $hdr[0] -eq $script:TPM_HDR_MAGIC1 -and $hdr[1] -eq $script:TPM_HDR_MAGIC2) {
+            $payloadLen = [int][System.Text.Encoding]::ASCII.GetString($hdr[2..5])
+            $payload = Read-Tpm2NvRange -Context $Context -NvIndex $NvIndex -PinBytes $pinBytes -Start $script:TPM_HDR_SIZE -Length $payloadLen -ChunkMax $chunkMax
+            return ,$payload
+        }
     }
-    ,$out
+    $raw = Read-Tpm2NvRange -Context $Context -NvIndex $NvIndex -PinBytes $pinBytes -Start 0 -Length $pub.DataSize -ChunkMax $chunkMax
+    $trimEnd = $raw.Length
+    while ($trimEnd -gt 0 -and ($raw[$trimEnd - 1] -eq 0x00 -or $raw[$trimEnd - 1] -eq 0xFF)) { $trimEnd-- }
+    if ($trimEnd -eq 0) { return ,([byte[]]@()) }
+    ,$raw[0..($trimEnd - 1)]
 }
 
 # Derives a stable API-key PIN from a deterministic ed25519 signature
@@ -543,51 +603,117 @@ function Get-TpmSecretReport {
     return @{ FoundKv = $foundKv; Names = $names; Invalid = $invalid }
 }
 
+# Reads NAME=VALUE lines from a dotenv-style file (blank lines and lines
+# whose first non-whitespace character is '#' are skipped) and re-encodes
+# them into this script's internal NAME="VALUE";NAME2="VALUE2" form. Values
+# may optionally be wrapped in matching single or double quotes in the
+# source file (stripped here); values containing a literal '"' or ';' are
+# rejected since the internal format has no escaping for those. Exits the
+# script on any parse error rather than prompting -- there's no interactive
+# user to ask when the input came from a file.
+function Get-TpmEnvFileSecret {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-TpmLine "[TPM] ERROR: Cannot read env file '$Path'. Aborting."
+        exit 1
+    }
+    $pairs = @()
+    $lineNo = 0
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $lineNo++
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrEmpty($trimmed)) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        $eq = $trimmed.IndexOf('=')
+        if ($eq -lt 0) {
+            Write-TpmLine "[TPM] ERROR: ${Path}:${lineNo} is not a NAME=VALUE line: $trimmed"
+            exit 1
+        }
+        $name = $trimmed.Substring(0, $eq).Trim()
+        $value = $trimmed.Substring($eq + 1).Trim()
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+            Write-TpmLine "[TPM] ERROR: ${Path}:${lineNo} has an invalid variable name `"$name`""
+            exit 1
+        }
+        if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        if ($value.Contains('"')) {
+            Write-TpmLine "[TPM] ERROR: ${Path}:${lineNo} value for $name contains a literal `" character, which this script's NAME=`"VALUE`" format cannot represent."
+            exit 1
+        }
+        if ($value.Contains(';')) {
+            Write-TpmLine "[TPM] ERROR: ${Path}:${lineNo} value for $name contains a literal ; character, which this script's NAME=`"VALUE`" format cannot represent."
+            exit 1
+        }
+        $pairs += "$name=`"$value`""
+    }
+    if ($pairs.Count -eq 0) {
+        Write-TpmLine "[TPM] ERROR: $Path contains no NAME=VALUE lines."
+        exit 1
+    }
+    return ($pairs -join ';')
+}
+
 Write-TpmLine "`n=== Phase 2: Configuration ==="
 
 $ApiNvSize = 1024
 $SshNvSize = 1024
+$ApiPayloadMax = $ApiNvSize - $script:TPM_HDR_SIZE
+$SshPayloadMax = $SshNvSize - $script:TPM_HDR_SIZE
 
 $apiKeyInput = $null
-for ($attempt = 1; $attempt -le 3; $attempt++) {
-    Write-TpmLine "Enter the value(s) to store in the TPM. This can be either:"
-    Write-TpmLine "  - a single API key/token, stored as `$env:SECURE_API_KEY, or"
-    Write-TpmLine "  - one or more named values: NAME1=`"value1`";NAME2=`"value2`";..."
-    $candidate = Read-Host "Enter value(s)"
-
-    if ([string]::IsNullOrEmpty($candidate)) {
-        Write-TpmLine "[TPM] ERROR: Value cannot be empty.`n"
-        continue
-    }
+if ($EnvFile) {
+    $candidate = Get-TpmEnvFileSecret -Path $EnvFile
     $byteLen = [System.Text.Encoding]::UTF8.GetByteCount($candidate)
-    if ($byteLen -gt $ApiNvSize) {
-        Write-TpmLine "[TPM] ERROR: Input is $byteLen bytes, which exceeds the $ApiNvSize-byte limit. Please shorten it.`n"
-        continue
+    if ($byteLen -gt $ApiPayloadMax) {
+        Write-TpmLine "[TPM] ERROR: $EnvFile contains $byteLen bytes, which exceeds the $ApiPayloadMax-byte limit ($($script:TPM_HDR_SIZE) bytes reserved for the on-TPM header). Aborting."
+        exit 1
     }
-
     $report = Get-TpmSecretReport -Raw $candidate
-    $confirmOk = $true
-    if ($report.FoundKv) {
-        Write-TpmLine "[TPM] Detected named value(s): $($report.Names -join ' ')"
-        if ($report.Invalid -gt 0) {
-            Write-TpmLine "[TPM] Warning: $($report.Invalid) segment(s) did not match NAME=`"VALUE`" and will be dropped at unlock time."
-            $confirmOk = (Read-Host "Proceed anyway? (y/n)") -match '^[Yy]'
+    Write-TpmLine "[TPM] Loaded value(s) from ${EnvFile}: $($report.Names -join ' ')"
+    $apiKeyInput = $candidate
+} else {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Write-TpmLine "Enter the value(s) to store in the TPM. This can be either:"
+        Write-TpmLine "  - a single API key/token, stored as `$env:SECURE_API_KEY, or"
+        Write-TpmLine "  - one or more named values: NAME1=`"value1`";NAME2=`"value2`";..."
+        $candidate = Read-Host "Enter value(s)"
+
+        if ([string]::IsNullOrEmpty($candidate)) {
+            Write-TpmLine "[TPM] ERROR: Value cannot be empty.`n"
+            continue
         }
-    } else {
-        if ($report.Invalid -gt 0) {
-            Write-TpmLine "[TPM] Warning: no valid NAME=`"VALUE`" pairs were recognized."
-            Write-TpmLine "This will be stored as a single opaque API key. If you intended separate values, check the format."
-            $confirmOk = (Read-Host "Proceed anyway? (y/n)") -match '^[Yy]'
+        $byteLen = [System.Text.Encoding]::UTF8.GetByteCount($candidate)
+        if ($byteLen -gt $ApiPayloadMax) {
+            Write-TpmLine "[TPM] ERROR: Input is $byteLen bytes, which exceeds the $ApiPayloadMax-byte limit ($($script:TPM_HDR_SIZE) bytes reserved for the on-TPM header). Please shorten it.`n"
+            continue
+        }
+
+        $report = Get-TpmSecretReport -Raw $candidate
+        $confirmOk = $true
+        if ($report.FoundKv) {
+            Write-TpmLine "[TPM] Detected named value(s): $($report.Names -join ' ')"
+            if ($report.Invalid -gt 0) {
+                Write-TpmLine "[TPM] Warning: $($report.Invalid) segment(s) did not match NAME=`"VALUE`" and will be dropped at unlock time."
+                $confirmOk = (Read-Host "Proceed anyway? (y/n)") -match '^[Yy]'
+            }
         } else {
-            Write-TpmLine "[TPM] Storing as a single API key."
+            if ($report.Invalid -gt 0) {
+                Write-TpmLine "[TPM] Warning: no valid NAME=`"VALUE`" pairs were recognized."
+                Write-TpmLine "This will be stored as a single opaque API key. If you intended separate values, check the format."
+                $confirmOk = (Read-Host "Proceed anyway? (y/n)") -match '^[Yy]'
+            } else {
+                Write-TpmLine "[TPM] Storing as a single API key."
+            }
         }
+        if ($confirmOk) { $apiKeyInput = $candidate; break }
+        Write-TpmLine ""
     }
-    if ($confirmOk) { $apiKeyInput = $candidate; break }
-    Write-TpmLine ""
-}
-if ($null -eq $apiKeyInput) {
-    Write-TpmLine "[TPM] ERROR: Too many invalid attempts. Aborting."
-    exit 1
+    if ($null -eq $apiKeyInput) {
+        Write-TpmLine "[TPM] ERROR: Too many invalid attempts. Aborting."
+        exit 1
+    }
 }
 
 $masterPin = $null
@@ -650,8 +776,8 @@ if (-not (Test-Path $sshKeyPath)) {
     }
 }
 $sshKeyBytes = [System.IO.File]::ReadAllBytes($sshKeyPath)
-if ($sshKeyBytes.Length -gt $SshNvSize) {
-    Write-TpmLine "[TPM] ERROR: $sshKeyPath is $($sshKeyBytes.Length) bytes, which exceeds the $SshNvSize-byte NV limit. Aborting."
+if ($sshKeyBytes.Length -gt $SshPayloadMax) {
+    Write-TpmLine "[TPM] ERROR: $sshKeyPath is $($sshKeyBytes.Length) bytes, which exceeds the $SshPayloadMax-byte NV limit ($($script:TPM_HDR_SIZE) bytes reserved for the on-TPM header). Aborting."
     exit 1
 }
 
@@ -783,7 +909,7 @@ function unlock_tpm {
             try {
                 try {
                     `$rawBytes = Read-Tpm2Nv -Context `$fastCtx -NvIndex $ApiNvIndex -Pin `$agentPin
-                    `$raw = [System.Text.Encoding]::UTF8.GetString(`$rawBytes).TrimEnd([char]0)
+                    `$raw = [System.Text.Encoding]::UTF8.GetString(`$rawBytes)
                     if (`$raw) {
                         Set-TpmSecretFromRaw -Raw `$raw
                         `$apiLoaded = `$true
@@ -825,7 +951,7 @@ function unlock_tpm {
                     if (`$derivedPin) { `$apiPin = `$derivedPin }
                 }
                 `$rawBytes = Read-Tpm2Nv -Context `$ctx -NvIndex $ApiNvIndex -Pin `$apiPin
-                `$raw = [System.Text.Encoding]::UTF8.GetString(`$rawBytes).TrimEnd([char]0)
+                `$raw = [System.Text.Encoding]::UTF8.GetString(`$rawBytes)
                 Set-TpmSecretFromRaw -Raw `$raw
             } catch {
                 Write-Host "[TPM] Error: Failed to load API secret: `$_"

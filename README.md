@@ -71,12 +71,15 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
    - If your group membership just changed, the script exits and asks you
      to **log out and back in**, then re-run it — group membership doesn't
      take effect in your current session.
-2. **Phase 2 — configuration**: prompts for the secret(s) to store and a
-   Master PIN (entered twice, hidden, and validated non-empty).
+2. **Phase 2 — configuration**: prompts for the secret(s) to store (or reads
+   them from a [`--env-file`](#loading-secrets-from-a-file---env-file) if
+   you passed one) and a Master PIN (entered twice, hidden, and validated
+   non-empty).
 3. **Phase 3 — SSH key setup**: uses `~/.ssh/id_ed25519`, offering to
    generate one with `ssh-keygen` if it doesn't exist. Also asks whether to
-   enable the [API Key Unlock Optimization](#api-key-unlock-optimization-ssh-agent-derived-pin)
-   (SSH-agent-derived PIN), on by default (can be turned off).
+   enable [ssh-agent Autostart](#ssh-agent-autostart) and the
+   [API Key Unlock Optimization](#api-key-unlock-optimization-ssh-agent-derived-pin)
+   (SSH-agent-derived PIN), both on by default (either can be turned off).
 4. **Phase 4 — seeding the TPM**: writes both secrets into TPM NV RAM,
    authenticated by your Master PIN (the API Key instead by the derived PIN,
    if that optimization is enabled). If a secret is already stored at that
@@ -115,12 +118,58 @@ parser you mean multiple named values rather than a single opaque key (so a
 plain key that happens to contain `=`, like base64 padding, is never
 misread).
 
+### Loading secrets from a file (`--env-file`)
+
+Instead of typing the value(s) interactively, point the script at a
+dotenv-style file:
+
+```sh
+./tpm_setup.sh --env-file ~/.env
+```
+
+```powershell
+pwsh -File tpm_setup.ps1 -EnvFile ~/.env
+```
+
+The file is one `NAME=value` per line; blank lines and lines starting with
+`#` are skipped, and a value may optionally be wrapped in matching single or
+double quotes (stripped before sealing):
+
+```
+# .env
+OPENAI_KEY=sk-abc123
+AWS_SECRET_ACCESS_KEY="xyz789 with spaces"
+```
+
+This always seals as named values (never as a single legacy opaque key,
+since a dotenv file is inherently key/value-oriented), and reuses the same
+`NAME="value"` on-TPM representation described above. A value containing a
+literal `"` or `;` is rejected with an error (the internal format has no way
+to escape either), and any parse error aborts immediately rather than
+prompting, since there's no interactive user to ask when the input came
+from a file.
+
 ### Unlock strategies
 
 - **[1] Automatic** (default): every new interactive shell prompts for the
   Master PIN immediately if secrets aren't already loaded.
 - **[2] Manual**: new shells print a one-line hint; you run `unlock_tpm`
   yourself whenever you need the keys.
+
+### ssh-agent Autostart
+
+Independent of unlocking your TPM secrets, a new shell can also make sure
+an `ssh-agent` is running for general `ssh-add`/agent-forwarding use — handy
+if you use **Manual** unlock mode and don't always run `unlock_tpm`. Phase 3
+asks about this separately from the API Key Unlock Optimization below; it's
+**on by default** and, like that setting, remembered in `~/.tpm_keys_state`
+across re-runs that keep existing data.
+
+When enabled, every new interactive shell checks whether `SSH_AUTH_SOCK`
+already points at a live agent — if a desktop keychain agent (GNOME
+Keyring, KDE Wallet, etc.) already owns it before the shell even starts,
+this is a no-op — and only starts a fresh `ssh-agent` if none is reachable
+or the one from an earlier shell has since died.
 
 ### API Key Unlock Optimization (SSH-agent-derived PIN)
 
@@ -200,9 +249,30 @@ Running `tpm_setup.sh` again is safe:
 - The `unlock_tpm` blocks added to `~/.bashrc`/`~/.shrc`/`~/.cshrc` are
   replaced in place, not duplicated.
 - Whether the API Key is sealed under the Master PIN or an SSH-agent-derived
-  PIN is remembered in `~/.tpm_keys_state`, so re-running without
-  re-seeding (keeping existing data) regenerates the shell integration
-  scripts with the correct unlock method instead of re-asking.
+  PIN, and whether ssh-agent Autostart is enabled, are both remembered in
+  `~/.tpm_keys_state`, so re-running without re-seeding (keeping existing
+  data) regenerates the shell integration scripts with the same settings
+  instead of re-asking.
+
+## On-TPM format
+
+Both scripts prepend a small 6-byte header (a 2-byte magic marker plus a
+4-digit zero-padded ASCII decimal length) to whatever gets sealed, so a read
+back always knows exactly how many bytes are real data — the rest of the
+fixed-size NV region is TPM erase-fill, whose value is
+implementation-defined (commonly `0x00`, but `0xFF` on some real hardware).
+Without this, that trailing filler could leak into `$SECURE_API_KEY` or
+corrupt the raw SSH key bytes. Secrets sealed before this existed have no
+header; unlocking falls back to a full-region read with trailing `0x00`/
+`0xFF` stripped, so already-sealed data keeps working without needing to be
+re-seeded. `tpm_setup.sh` and `tpm_setup.ps1` use the identical byte layout,
+so this doesn't affect dual-boot sharing.
+
+## Testing
+
+`tests/` has a small suite covering the on-TPM header format, the
+`--env-file` parser, and a tcsh alias regression, for both scripts. Run
+`./tests/run_all.sh`; see `tests/README.md` for details and prerequisites.
 
 ## Security notes
 

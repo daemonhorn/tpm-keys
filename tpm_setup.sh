@@ -5,6 +5,36 @@
 
 set -e
 
+# --- CLI argument parsing ---
+ENV_FILE=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --env-file)
+            if [ "$#" -lt 2 ]; then
+                printf "[TPM] ERROR: --env-file requires a path argument.\n"
+                exit 1
+            fi
+            ENV_FILE="$2"
+            shift 2
+            ;;
+        --env-file=*)
+            ENV_FILE="${1#--env-file=}"
+            shift
+            ;;
+        -h | --help)
+            printf "Usage: %s [--env-file <path>]\n\n" "$0"
+            printf "%s\n" "  --env-file <path>  Read the API key/value(s) to seal from a dotenv-style"
+            printf "%s\n" "                     file (NAME=VALUE per line) instead of the interactive"
+            printf "%s\n" "                     Phase 2 prompt."
+            exit 0
+            ;;
+        *)
+            printf "[TPM] ERROR: Unknown argument: %s\n" "$1"
+            exit 1
+            ;;
+    esac
+done
+
 # $USER isn't guaranteed to be set (containers, cron, some su contexts).
 USER="${USER:-$(id -un)}"
 
@@ -220,6 +250,111 @@ SSH_NV_INDEX=$(printf "0x%X" $(( 22020096 + USER_UID * 2 + 1 )))
 API_NV_SIZE=1024
 SSH_NV_SIZE=1024
 
+# --- On-TPM wire format: a 6-byte header (2-byte magic + 4-digit zero-
+# padded ASCII decimal length) is prepended to every write, so a read can
+# pull back exactly the real payload instead of the TPM's erase-fill
+# garbage padding out the rest of the fixed-size NV region (0x00 on some
+# TPMs, 0xFF on others -- verified on FreeBSD, where it previously
+# corrupted $SECURE_API_KEY and the raw SSH key bytes with trailing junk).
+# Secrets sealed before this existed have no header; the read side falls
+# back to a full-region read with trailing 0x00/0xFF stripped for those, so
+# already-sealed data keeps working. This constant pair is shared verbatim
+# (as literal numbers) with the generated unlock scripts -- see
+# _tpm_read_secret below.
+#
+# The length is ASCII decimal, not a raw binary big-endian value, because
+# real-world testing on FreeBSD's native /bin/sh found that `printf '%b'`
+# truncates its whole output at the first embedded NUL byte it emits --
+# and a binary length's high byte is 0x00 for every payload under 256
+# bytes, i.e. virtually always, silently dropping the rest of the header
+# (and misaligning the payload behind it) on that shell. bash's printf
+# doesn't have this problem, which is why it went undetected until tested
+# on a real target shell. ASCII digits are never NUL, sidestepping the
+# issue entirely, at the cost of 2 extra header bytes.
+TPM_HDR_MAGIC1=165  # 0xA5
+TPM_HDR_MAGIC2=126  # 0x7E
+TPM_HDR_SIZE=6
+API_PAYLOAD_MAX=$((API_NV_SIZE - TPM_HDR_SIZE))
+SSH_PAYLOAD_MAX=$((SSH_NV_SIZE - TPM_HDR_SIZE))
+
+# Emits the 6 raw header bytes (2-byte magic, via printf's POSIX-guaranteed
+# \0NNN octal-escape handling for %b, plus a 4-digit zero-padded ASCII
+# decimal length via a plain, universally-portable printf conversion -- see
+# the wire-format comment above for why the length isn't raw binary).
+_tpm_emit_header() {
+    LEN="$1"
+    printf '%b' '\0245\0176'
+    printf '%04d' "$LEN"
+}
+
+# Reads a secret from NV index $1 (auth $2) and writes the exact payload
+# bytes to stdout: if the header's magic matches, reads exactly the
+# recorded length at offset $TPM_HDR_SIZE (exact, no trimming needed);
+# otherwise falls back to a full-region read with trailing 0x00/0xFF
+# stripped, for secrets sealed before this header format existed. Safe for
+# both text (API key, captured via `$()`) and binary (SSH key, streamed
+# straight to `ssh-add -`) payloads -- the header itself is decoded via
+# `od`, which never holds raw bytes in a shell variable, so it can't be
+# truncated by an embedded NUL the way capturing raw bytes in `$()` would.
+_tpm_read_secret() {
+    IDX="$1"
+    PIN="$2"
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 3 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s "$TPM_HDR_SIZE" --offset=0 "$IDX" 2>/dev/null | od -An -tu1)
+        OLD_IFS="$IFS"
+        IFS=" $(printf '\t')"
+        set -- $HDR
+        IFS="$OLD_IFS"
+        [ "$#" -ge 6 ] && break
+    done
+    if [ "$#" -lt 6 ]; then
+        # Every NV index this script defines is at least TPM_HDR_SIZE bytes,
+        # so a successful read always returns at least this many bytes -- a
+        # short/empty result here (even after retrying) means the read
+        # itself failed (wrong PIN, a transient TPM/TCTI I/O error -- seen
+        # in practice under back-to-back tpm2_nvread calls, or the index
+        # doesn't exist), not "no header, this must be legacy data". Report
+        # a clean failure instead of falling through to the legacy
+        # full-region read below: that path would misread the still-present
+        # header bytes as leading payload garbage if this was just a
+        # transient hiccup rather than genuinely headerless legacy data.
+        return 1
+    fi
+    IS_HEADER=0
+    if [ "$1" = "$TPM_HDR_MAGIC1" ] && [ "$2" = "$TPM_HDR_MAGIC2" ]; then
+        IS_HEADER=1
+        for D in "$3" "$4" "$5" "$6"; do
+            case "$D" in
+                4[89] | 5[0-7]) ;;
+                *) IS_HEADER=0 ;;
+            esac
+        done
+    fi
+    [ "$IS_HEADER" -eq 1 ] && HDR_LEN=$(( ($3 - 48) * 1000 + ($4 - 48) * 100 + ($5 - 48) * 10 + ($6 - 48) ))
+    # Retry the payload read itself too, not just the header peek above --
+    # the same transient I/O error can strike here. Written to a temp file
+    # rather than a shell variable so binary payloads (the SSH key) survive
+    # exactly, including any embedded NUL bytes a `$()` capture would
+    # truncate; an empty result (rather than a specific expected length,
+    # which the API-key case doesn't have on hand here) is what's retried
+    # on, which is safe since every secret this script seeds is non-empty.
+    TMPFILE=$(mktemp) || return 1
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 3 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        if [ "$IS_HEADER" -eq 1 ]; then
+            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset="$TPM_HDR_SIZE" "$IDX" 2>/dev/null > "$TMPFILE"
+        else
+            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null | env LC_ALL=C tr -d '\0\377' > "$TMPFILE"
+        fi
+        [ -s "$TMPFILE" ] && break
+    done
+    cat "$TMPFILE"
+    rm -f "$TMPFILE"
+}
+
 # Remembers which PIN sealed the API Key NV index ("master" or "agent" -- see
 # the "API Key Unlock Optimization" prompt below) across re-runs where the
 # user keeps existing data (RESEED=0) and Phase 5 regenerates the shell
@@ -227,6 +362,7 @@ SSH_NV_SIZE=1024
 # before this feature existed.
 STATE_FILE="$HOME/.tpm_keys_state"
 API_AUTH_MODE="master"
+SSH_AGENT_AUTOSTART="no"
 [ -f "$STATE_FILE" ] && . "$STATE_FILE"
 
 # Belt-and-suspenders check: even after the group-membership gate above, a
@@ -340,6 +476,87 @@ _tpm_report_secret() {
     set +f
 }
 
+# Reads NAME=VALUE lines from a dotenv-style file (blank lines and lines
+# whose first non-whitespace character is '#' are skipped) and re-encodes
+# them into this script's internal NAME="VALUE";NAME2="VALUE2" form.
+# Whitespace around NAME/VALUE is trimmed; VALUE may optionally be wrapped
+# in matching single or double quotes in the source file (stripped here).
+# Values containing a literal '"' or ';' are rejected since the internal
+# format has no escaping for those. Exits the script on any parse error
+# rather than prompting -- there's no interactive user to ask when the
+# input came from a file.
+_tpm_trim() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+_tpm_parse_env_file() {
+    FILE="$1"
+    RESULT=""
+    LINE_NO=0
+    while IFS= read -r LINE || [ -n "$LINE" ]; do
+        LINE_NO=$((LINE_NO + 1))
+        TRIMMED=$(_tpm_trim "$LINE")
+        [ -z "$TRIMMED" ] && continue
+        case "$TRIMMED" in
+            '#'*) continue ;;
+        esac
+        case "$TRIMMED" in
+            *=*)
+                NAME=$(_tpm_trim "${TRIMMED%%=*}")
+                VALUE=$(_tpm_trim "${TRIMMED#*=}")
+                ;;
+            *)
+                printf "[TPM] ERROR: %s:%s is not a NAME=VALUE line: %s\n" "$FILE" "$LINE_NO" "$TRIMMED" >&2
+                return 1
+                ;;
+        esac
+        case "$NAME" in
+            '' | *[!A-Za-z0-9_]* | [0-9]*)
+                printf "[TPM] ERROR: %s:%s has an invalid variable name \"%s\"\n" "$FILE" "$LINE_NO" "$NAME" >&2
+                return 1
+                ;;
+        esac
+        case "$VALUE" in
+            \"*\") VALUE="${VALUE#\"}"; VALUE="${VALUE%\"}" ;;
+            \'*\') VALUE="${VALUE#\'}"; VALUE="${VALUE%\'}" ;;
+        esac
+        case "$VALUE" in
+            *'"'*)
+                printf "[TPM] ERROR: %s:%s value for %s contains a literal \" character, which this script's NAME=\"VALUE\" format cannot represent.\n" "$FILE" "$LINE_NO" "$NAME" >&2
+                return 1
+                ;;
+            *';'*)
+                printf "[TPM] ERROR: %s:%s value for %s contains a literal ; character, which this script's NAME=\"VALUE\" format cannot represent.\n" "$FILE" "$LINE_NO" "$NAME" >&2
+                return 1
+                ;;
+        esac
+        [ -n "$RESULT" ] && RESULT="$RESULT;"
+        RESULT="$RESULT$NAME=\"$VALUE\""
+    done < "$FILE"
+    if [ -z "$RESULT" ]; then
+        printf "[TPM] ERROR: %s contains no NAME=VALUE lines.\n" "$FILE" >&2
+        return 1
+    fi
+    printf '%s' "$RESULT"
+}
+
+if [ -n "$ENV_FILE" ]; then
+    if [ ! -r "$ENV_FILE" ]; then
+        printf "[TPM] ERROR: Cannot read env file '%s'. Aborting.\n" "$ENV_FILE"
+        exit 1
+    fi
+    if ! API_KEY_INPUT=$(_tpm_parse_env_file "$ENV_FILE"); then
+        exit 1
+    fi
+    INPUT_LEN=$(printf '%s' "$API_KEY_INPUT" | wc -c | tr -d ' ')
+    if [ "$INPUT_LEN" -gt "$API_PAYLOAD_MAX" ]; then
+        printf "[TPM] ERROR: %s contains %s bytes, which exceeds the %s-byte limit (%s bytes reserved for the on-TPM header). Aborting.\n" "$ENV_FILE" "$INPUT_LEN" "$API_PAYLOAD_MAX" "$TPM_HDR_SIZE"
+        exit 1
+    fi
+    _tpm_report_secret "$API_KEY_INPUT"
+    printf "[TPM] Loaded value(s) from %s:%s\n" "$ENV_FILE" "$NAMES"
+else
+
 API_ATTEMPTS=0
 while :; do
     API_ATTEMPTS=$((API_ATTEMPTS + 1))
@@ -353,8 +570,8 @@ while :; do
         printf "[TPM] ERROR: Value cannot be empty.\n\n"
     else
         INPUT_LEN=$(printf '%s' "$API_KEY_INPUT" | wc -c | tr -d ' ')
-        if [ "$INPUT_LEN" -gt "$API_NV_SIZE" ]; then
-            printf "[TPM] ERROR: Input is %s bytes, which exceeds the %s-byte limit. Please shorten it.\n\n" "$INPUT_LEN" "$API_NV_SIZE"
+        if [ "$INPUT_LEN" -gt "$API_PAYLOAD_MAX" ]; then
+            printf "[TPM] ERROR: Input is %s bytes, which exceeds the %s-byte limit (%s bytes reserved for the on-TPM header). Please shorten it.\n\n" "$INPUT_LEN" "$API_PAYLOAD_MAX" "$TPM_HDR_SIZE"
         else
             _tpm_report_secret "$API_KEY_INPUT"
             CONFIRM_OK=1
@@ -388,6 +605,8 @@ while :; do
     fi
     printf "\n"
 done
+
+fi # ENV_FILE
 
 PIN_ATTEMPTS=0
 while :; do
@@ -431,10 +650,23 @@ if [ ! -f "$SSH_KEY_PATH" ]; then
 fi
 
 SSH_KEY_SIZE=$(wc -c < "$SSH_KEY_PATH" | tr -d ' ')
-if [ "$SSH_KEY_SIZE" -gt "$SSH_NV_SIZE" ]; then
-    printf "[TPM] ERROR: %s is %s bytes, which exceeds the %s-byte NV limit. Aborting.\n" "$SSH_KEY_PATH" "$SSH_KEY_SIZE" "$SSH_NV_SIZE"
+if [ "$SSH_KEY_SIZE" -gt "$SSH_PAYLOAD_MAX" ]; then
+    printf "[TPM] ERROR: %s is %s bytes, which exceeds the %s-byte NV limit (%s bytes reserved for the on-TPM header). Aborting.\n" "$SSH_KEY_PATH" "$SSH_KEY_SIZE" "$SSH_PAYLOAD_MAX" "$TPM_HDR_SIZE"
     exit 1
 fi
+
+printf "\n%s\n" "--- ssh-agent Autostart ---"
+printf "%s\n" "Independent of unlocking your TPM secrets, a new shell can also make sure"
+printf "%s\n" "an ssh-agent is running for general ssh-add/agent-forwarding use -- handy"
+printf "%s\n" "if you use Manual unlock mode and don't always run 'unlock_tpm'. This is"
+printf "%s\n" "a no-op if a desktop keychain agent (GNOME Keyring, KDE Wallet, etc.)"
+printf "%s\n" "already owns \$SSH_AUTH_SOCK by the time the shell starts."
+printf "Automatically start ssh-agent in every new shell if none is already running? (y/n) [default: y]: "
+read SSH_AGENT_AUTOSTART_CHOICE
+case "$SSH_AGENT_AUTOSTART_CHOICE" in
+    [Nn]*) SSH_AGENT_AUTOSTART="no" ;;
+    *) SSH_AGENT_AUTOSTART="yes" ;;
+esac
 
 printf "\n%s\n" "--- API Key Unlock Optimization ---"
 printf "%s\n" "ssh-agent keeps your loaded SSH identity available across every new"
@@ -521,14 +753,14 @@ if [ "$API_AUTH_MODE" = "agent" ]; then
     fi
     unset DERIVED_API_PIN
 fi
-printf "API_AUTH_MODE=%s\n" "$API_AUTH_MODE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+printf "API_AUTH_MODE=%s\nSSH_AGENT_AUTOSTART=%s\n" "$API_AUTH_MODE" "$SSH_AGENT_AUTOSTART" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
 
 printf "Writing API Key to TPM (%s)...\n" "$API_NV_INDEX"
 if ! tpm2_nvdefine -C o -s "$API_NV_SIZE" -a "authread|authwrite" -p "$API_NV_AUTH" "$API_NV_INDEX"; then
     printf "[TPM] ERROR: Failed to define the API Key NV index. Aborting.\n"
     exit 1
 fi
-if ! printf "%s" "$API_KEY_INPUT" | tpm2_nvwrite -C "$API_NV_INDEX" -P "$API_NV_AUTH" -i - "$API_NV_INDEX"; then
+if ! { _tpm_emit_header "$INPUT_LEN"; printf "%s" "$API_KEY_INPUT"; } | tpm2_nvwrite -C "$API_NV_INDEX" -P "$API_NV_AUTH" -i - "$API_NV_INDEX"; then
     printf "[TPM] ERROR: Failed to write the API Key to the TPM. Aborting.\n"
     exit 1
 fi
@@ -539,7 +771,7 @@ if ! tpm2_nvdefine -C o -s "$SSH_NV_SIZE" -a "authread|authwrite" -p "$MASTER_PI
     printf "[TPM] ERROR: Failed to define the SSH Key NV index. Aborting.\n"
     exit 1
 fi
-if ! tpm2_nvwrite -C "$SSH_NV_INDEX" -P "$MASTER_PIN" -i "$SSH_KEY_PATH" "$SSH_NV_INDEX"; then
+if ! { _tpm_emit_header "$SSH_KEY_SIZE"; cat "$SSH_KEY_PATH"; } | tpm2_nvwrite -C "$SSH_NV_INDEX" -P "$MASTER_PIN" -i - "$SSH_NV_INDEX"; then
     printf "[TPM] ERROR: Failed to write the SSH Key to the TPM. Aborting.\n"
     exit 1
 fi
@@ -604,6 +836,52 @@ _tpm_derive_api_pin() {
     printf "%s" "$DERIVED"
 }
 
+# Reads a secret from NV index $1 (auth $2), writing the exact payload
+# bytes to stdout. See _tpm_read_secret in tpm_setup.sh for the full
+# rationale -- this is the same function, embedded verbatim here so the
+# generated unlock code has no dependency back on the setup script.
+_tpm_read_secret() {
+    IDX="$1"
+    PIN="$2"
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 3 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>/dev/null | od -An -tu1)
+        OLD_IFS="$IFS"
+        IFS=" $(printf '"'"'\t'"'"')"
+        set -- $HDR
+        IFS="$OLD_IFS"
+        [ "$#" -ge 6 ] && break
+    done
+    if [ "$#" -lt 6 ]; then
+        return 1
+    fi
+    IS_HEADER=0
+    if [ "$1" = "165" ] && [ "$2" = "126" ]; then
+        IS_HEADER=1
+        for D in "$3" "$4" "$5" "$6"; do
+            case "$D" in
+                4[89] | 5[0-7]) ;;
+                *) IS_HEADER=0 ;;
+            esac
+        done
+    fi
+    [ "$IS_HEADER" -eq 1 ] && HDR_LEN=$(( ($3 - 48) * 1000 + ($4 - 48) * 100 + ($5 - 48) * 10 + ($6 - 48) ))
+    TMPFILE=$(mktemp) || return 1
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 3 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        if [ "$IS_HEADER" -eq 1 ]; then
+            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset=6 "$IDX" 2>/dev/null > "$TMPFILE"
+        else
+            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null | env LC_ALL=C tr -d '"'"'\0\377'"'"' > "$TMPFILE"
+        fi
+        [ -s "$TMPFILE" ] && break
+    done
+    cat "$TMPFILE"
+    rm -f "$TMPFILE"
+}
+
 _tpm_load_secret() {
     RAW="$1"
     FOUND_KV=0
@@ -653,12 +931,23 @@ _tpm_needs_unlock() {
     [ -z "$SECURE_API_KEY" ] && NEEDS_API=1
 }
 
+# Starts ssh-agent only if none is actually reachable: a no-op when
+# $SSH_AUTH_SOCK already points at a live agent (whether ours from an
+# earlier shell, or a desktop keychain agent like GNOME Keyring/KDE Wallet
+# that owns it before any terminal even launches), and only replaces it
+# when $SSH_AGENT_PID names a process of ours that has since died. Shared
+# by unlock_tpm and the standalone shell-startup autostart hook below, so
+# both agree on what counts as "already running".
+_tpm_ensure_ssh_agent() {
+    if [ -z "$SSH_AUTH_SOCK" ] || { [ -n "$SSH_AGENT_PID" ] && ! kill -0 "$SSH_AGENT_PID" 2>/dev/null; }; then
+        eval "$(ssh-agent -s)" > /dev/null
+    fi
+}
+
 unlock_tpm() {
     _tpm_needs_unlock
     if [ "$NEEDS_SSH" -eq 1 ] || [ "$NEEDS_API" -eq 1 ]; then
-        if [ -z "$SSH_AUTH_SOCK" ] || { [ -n "$SSH_AGENT_PID" ] && ! kill -0 "$SSH_AGENT_PID" 2>/dev/null; }; then
-            eval "$(ssh-agent -s)" > /dev/null
-        fi
+        _tpm_ensure_ssh_agent
 
         # Fast path: the SSH identity is already resident in the agent (e.g.
         # a second gnome-terminal tab in the same session) and only the API
@@ -666,7 +955,7 @@ unlock_tpm() {
         # re-prompting for the Master PIN.
         if [ "$NEEDS_SSH" -eq 0 ] && [ "$NEEDS_API" -eq 1 ] && [ "$TPM_API_AUTH_MODE" = "agent" ]; then
             if AGENT_PIN=$(_tpm_derive_api_pin "$TPM_SSH_PUB_PATH") && [ -n "$AGENT_PIN" ]; then
-                RAW_SECRET=$(tpm2_nvread -C '"$API_NV_INDEX"' -P "$AGENT_PIN" '"$API_NV_INDEX"' 2>/dev/null | env LC_ALL=C tr -d '\''\0'\'')
+                RAW_SECRET=$(_tpm_read_secret '"$API_NV_INDEX"' "$AGENT_PIN")
                 unset AGENT_PIN
                 if [ -n "$RAW_SECRET" ]; then
                     _tpm_load_secret "$RAW_SECRET"
@@ -682,7 +971,7 @@ unlock_tpm() {
         trap - INT TERM
 
         if [ "$NEEDS_SSH" -eq 1 ]; then
-            tpm2_nvread -C '"$SSH_NV_INDEX"' -P "$USER_PIN" '"$SSH_NV_INDEX"' 2>/dev/null | ssh-add - || printf "%s\n" "[TPM] Error: Failed to load SSH key."
+            _tpm_read_secret '"$SSH_NV_INDEX"' "$USER_PIN" | ssh-add - || printf "%s\n" "[TPM] Error: Failed to load SSH key."
         fi
         if [ "$NEEDS_API" -eq 1 ]; then
             API_PIN="$USER_PIN"
@@ -691,7 +980,7 @@ unlock_tpm() {
                 [ -n "$AGENT_PIN" ] && API_PIN="$AGENT_PIN"
                 unset AGENT_PIN
             fi
-            RAW_SECRET=$(tpm2_nvread -C '"$API_NV_INDEX"' -P "$API_PIN" '"$API_NV_INDEX"' 2>/dev/null | env LC_ALL=C tr -d '\''\0'\'')
+            RAW_SECRET=$(_tpm_read_secret '"$API_NV_INDEX"' "$API_PIN")
             unset API_PIN
             if [ -n "$RAW_SECRET" ]; then
                 _tpm_load_secret "$RAW_SECRET"
@@ -704,6 +993,11 @@ unlock_tpm() {
     fi
 }
 '
+
+if [ "$SSH_AGENT_AUTOSTART" = "yes" ]; then
+    SHRC_SNIPPET="$SHRC_SNIPPET"'
+case "$-" in *i*) _tpm_ensure_ssh_agent ;; esac'
+fi
 
 if [ "$STRATEGY_CHOICE" = "2" ]; then
     SHRC_SNIPPET="$SHRC_SNIPPET"'
@@ -733,12 +1027,57 @@ MODE="$1"
 IDX="$2"
 PIN="$3"
 
+# Reads a secret from NV index $1 (auth $2), writing the exact payload
+# bytes to stdout -- see _tpm_read_secret in tpm_setup.sh for the full
+# rationale (magic-header detection with a legacy-data fallback).
+_tpm_read_secret() {
+    IDX="$1"
+    PIN="$2"
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 3 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>/dev/null | od -An -tu1)
+        OLD_IFS="$IFS"
+        IFS=" $(printf '\t')"
+        set -- $HDR
+        IFS="$OLD_IFS"
+        [ "$#" -ge 6 ] && break
+    done
+    if [ "$#" -lt 6 ]; then
+        return 1
+    fi
+    IS_HEADER=0
+    if [ "$1" = "165" ] && [ "$2" = "126" ]; then
+        IS_HEADER=1
+        for D in "$3" "$4" "$5" "$6"; do
+            case "$D" in
+                4[89] | 5[0-7]) ;;
+                *) IS_HEADER=0 ;;
+            esac
+        done
+    fi
+    [ "$IS_HEADER" -eq 1 ] && HDR_LEN=$(( ($3 - 48) * 1000 + ($4 - 48) * 100 + ($5 - 48) * 10 + ($6 - 48) ))
+    TMPFILE=$(mktemp) || return 1
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 3 ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        if [ "$IS_HEADER" -eq 1 ]; then
+            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset=6 "$IDX" 2>/dev/null > "$TMPFILE"
+        else
+            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null | env LC_ALL=C tr -d '\0\377' > "$TMPFILE"
+        fi
+        [ -s "$TMPFILE" ] && break
+    done
+    cat "$TMPFILE"
+    rm -f "$TMPFILE"
+}
+
 case "$MODE" in
     ssh)
-        tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null
+        _tpm_read_secret "$IDX" "$PIN"
         ;;
     api)
-        RAW=$(tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null | env LC_ALL=C tr -d '\0')
+        RAW=$(_tpm_read_secret "$IDX" "$PIN")
         emit() {
             NAME="$1"
             VALUE="$2"
@@ -767,7 +1106,12 @@ case "$MODE" in
             esac
         done
         set +f
-        [ "$FOUND_KV" -eq 0 ] && emit SECURE_API_KEY "$RAW"
+        # Only emit the legacy single-key form when RAW is non-empty --
+        # otherwise a failed/empty read (bad PIN, index doesn't exist) would
+        # still produce a `setenv SECURE_API_KEY ''` line, making the output
+        # file non-empty and tricking .tpm_unlock.csh's `-s` check into
+        # reporting success for a secret that was never actually loaded.
+        [ "$FOUND_KV" -eq 0 ] && [ -n "$RAW" ] && emit SECURE_API_KEY "$RAW"
         ;;
     agentpin)
         # Derives the API Key's TPM auth PIN from a deterministic ed25519
@@ -814,9 +1158,20 @@ cat << 'EOF' > "$HOME/.tpm_unlock.csh"
 # TPM Secure Environment Setup Helper (tcsh)
 set needs_ssh = 0
 set needs_api = 0
+# Starts ssh-agent only if none is actually reachable: a no-op when
+# $SSH_AUTH_SOCK already points at a live agent (ours or a desktop keychain
+# agent that owns it before tcsh even starts), and only replaces it when
+# $SSH_AGENT_PID names a process of ours that has since died. tcsh's own
+# `kill` builtin is shelled out to via `sh` for consistent -0 semantics.
+set _tpm_start_agent = 0
 if (! $?SSH_AUTH_SOCK) then
-    eval `ssh-agent -c` > /dev/null
+    set _tpm_start_agent = 1
+else if ($?SSH_AGENT_PID) then
+    sh -c 'kill -0 "$1" 2>/dev/null' -- "$SSH_AGENT_PID"
+    if ( $status != 0 ) set _tpm_start_agent = 1
 endif
+if ( $_tpm_start_agent == 1 ) eval `ssh-agent -c` > /dev/null
+unset _tpm_start_agent
 sh -c 'ssh-add -l 2>/dev/null' | grep -q "ED25519"
 if ( $status != 0 ) set needs_ssh = 1
 if (! $?SECURE_API_KEY) set needs_api = 1
@@ -886,6 +1241,21 @@ CSHRC_SNIPPET='
 alias unlock_tpm "source ~/.tpm_unlock.csh"
 '
 
+if [ "$SSH_AGENT_AUTOSTART" = "yes" ]; then
+    CSHRC_SNIPPET="$CSHRC_SNIPPET"'
+if ($?prompt) then
+    set _tpm_start_agent = 0
+    if (! $?SSH_AUTH_SOCK) then
+        set _tpm_start_agent = 1
+    else if ($?SSH_AGENT_PID) then
+        sh -c '\''kill -0 "$1" 2>/dev/null'\'' -- "$SSH_AGENT_PID"
+        if ( $status != 0 ) set _tpm_start_agent = 1
+    endif
+    if ( $_tpm_start_agent == 1 ) eval `ssh-agent -c` > /dev/null
+    unset _tpm_start_agent
+endif'
+fi
+
 if [ "$STRATEGY_CHOICE" = "2" ]; then
     CSHRC_SNIPPET="$CSHRC_SNIPPET"'
 if ($?prompt) then
@@ -904,8 +1274,16 @@ if ($?prompt) then
     unset _tpm_hint_needed
 endif'
 else
+    # NOT "if ($?prompt) unlock_tpm" -- tcsh's single-line "if (expr) command"
+    # form does not go through alias substitution (confirmed: it runs a
+    # *different* code path than a command typed on its own line, which is
+    # where alias expansion actually happens), so it fails with
+    # "unlock_tpm: Command not found." even though the alias is defined.
+    # Only the multi-line if/then/endif form expands aliases correctly.
     CSHRC_SNIPPET="$CSHRC_SNIPPET"'
-if ($?prompt) unlock_tpm'
+if ($?prompt) then
+    unlock_tpm
+endif'
 fi
 
 CSHRC_SNIPPET="$CSHRC_SNIPPET
