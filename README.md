@@ -99,7 +99,11 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
    you passed one) and a Master PIN (entered twice, hidden, and validated
    non-empty).
 3. **Phase 3 — SSH key setup**: uses `~/.ssh/id_ed25519`, offering to
-   generate one with `ssh-keygen` if it doesn't exist. Also asks whether to
+   generate one with `ssh-keygen` if it doesn't exist (if ssh-agent already
+   has an ED25519 identity loaded from elsewhere, it warns first: agents
+   never let you export the private key material of an already-loaded
+   identity, so that one can't be reused here regardless — continuing
+   generates a separate, TPM-dedicated key). Also asks whether to
    enable [ssh-agent Autostart](#ssh-agent-autostart) and the
    [API Key Unlock Optimization](#api-key-unlock-optimization-ssh-agent-derived-pin)
    (SSH-agent-derived PIN), both on by default (either can be turned off).

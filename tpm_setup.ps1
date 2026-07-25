@@ -873,6 +873,23 @@ Write-TpmLine "`n=== Phase 3: SSH Key Setup ==="
 $sshDir = Join-Path $HOME ".ssh"
 $sshKeyPath = Join-Path $sshDir "id_ed25519"
 if (-not (Test-Path $sshKeyPath)) {
+    # An identity already loaded in ssh-agent (a hardware security key, one
+    # loaded from a different path, an agent-forwarded identity, etc.) does
+    # NOT mean there's a key file to seal here: agents intentionally never
+    # let you export the private key material of an already-loaded
+    # identity, only sign with it. Flag this before offering to generate a
+    # new one, so it's a deliberate choice (a separate, TPM-dedicated key)
+    # rather than a surprise once they notice they now have two identities.
+    $existingIdentities = & ssh-add -l 2>$null
+    if (($existingIdentities -join "`n") -match 'ED25519') {
+        Write-TpmLine ""
+        Write-TpmLine "[TPM] Note: an ED25519 identity is already loaded in ssh-agent, but no key"
+        Write-TpmLine "file exists at $sshKeyPath. This script seals the actual private key"
+        Write-TpmLine "FILE in the TPM -- ssh-agent can't export the key material of an"
+        Write-TpmLine "already-loaded identity, so that one can't be reused here even though"
+        Write-TpmLine "it's active. Continuing will generate a NEW key dedicated to this setup."
+        Write-TpmLine ""
+    }
     $gen = Read-Host "No Ed25519 key found at $sshKeyPath. Generate one now? (y/n)"
     if ($gen -match '^[Yy]') {
         if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir | Out-Null }

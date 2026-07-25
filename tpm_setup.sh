@@ -746,6 +746,21 @@ done
 # --- 3. SSH Key Generation ---
 printf "\n%s\n" "=== Phase 3: SSH Key Setup ==="
 if [ ! -f "$SSH_KEY_PATH" ]; then
+    # An identity already loaded in ssh-agent (a hardware security key, one
+    # loaded from a different path, an agent-forwarded identity, etc.) does
+    # NOT mean there's a key file to seal here: agents intentionally never
+    # let you export the private key material of an already-loaded
+    # identity, only sign with it. Flag this before offering to generate a
+    # new one, so it's a deliberate choice (a separate, TPM-dedicated key)
+    # rather than a surprise once they notice they now have two identities.
+    if ssh-add -l 2>/dev/null | grep -q "ED25519"; then
+        printf "\n%s\n" "[TPM] Note: an ED25519 identity is already loaded in ssh-agent, but no key"
+        printf "%s\n" "file exists at $SSH_KEY_PATH. This script seals the actual private key"
+        printf "%s\n" "FILE in the TPM -- ssh-agent can't export the key material of an"
+        printf "%s\n" "already-loaded identity, so that one can't be reused here even though"
+        printf "%s\n" "it's active. Continuing will generate a NEW key dedicated to this setup."
+        printf "\n"
+    fi
     printf "No Ed25519 key found at %s. Generate one now? (y/n): " "$SSH_KEY_PATH"
     read GEN_KEY
     case "$GEN_KEY" in

@@ -60,6 +60,16 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   available) `tpm_setup.ps1 -Help`/`-h`, checking each exits 0 and mentions
   every other CLI flag the script currently supports, so adding a new flag
   without updating its usage text shows up as a test failure.
+- `test_ssh_agent_key_check.sh` -- regression test for a real logic flaw:
+  Phase 3's "no key file, generate one?" prompt didn't check whether
+  ssh-agent already had an ED25519 identity loaded (e.g. a hardware
+  security key, or one loaded from a different path) before offering to
+  generate a brand-new one -- which can't ever reuse that identity anyway
+  (agents never export the private key material of an already-loaded
+  identity), so silently generating a second, unrelated key was a surprise
+  waiting to happen. Confirms both scripts now print a clear note in that
+  case, and don't when the agent has nothing loaded, using fake
+  `ssh-add`/`ssh-keygen` stubs against the real extracted code.
 - `lib/extract.sh` -- pulls a single named function's source out of
   `tpm_setup.sh` so these tests exercise the real shipped code rather than
   a reimplementation that could drift out of sync with it.
