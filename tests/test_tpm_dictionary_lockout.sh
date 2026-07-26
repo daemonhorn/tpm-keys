@@ -18,6 +18,23 @@
 # the caller lacks permission) or the TPM is still locked after clearing,
 # it stops retrying immediately (further identical attempts won't help)
 # and prints a clear, actionable message instead of the generic failure.
+#
+# Separately: a raw hardware TPM's DA counter is shared across the whole
+# chip, not per-index, and the header-peek loop alone retries up to 3
+# times -- enough by itself to turn a genuinely WRONG PIN into a lockout
+# mid-call (MAX_AUTH_FAIL is commonly 3). Confirmed directly on
+# dhorn@freebsd-test: typing a deliberately wrong PIN produced "[TPM]
+# Note: the TPM was in dictionary-attack lockout from prior failed
+# attempts (not a wrong PIN) -- cleared automatically, retrying." --
+# which is actively misleading (it WAS this PIN) -- followed by the SSH
+# key failing as expected, but then "[TPM] Secrets loaded." for the API
+# key, because the auto-clear-and-retry used the separately-derived
+# agent PIN, which happened to still be valid from an earlier session.
+# _tpm_read_secret now tracks, within a single call, whether THIS PIN
+# already produced a genuine wrong-PIN failure (0x98E, "the authorization
+# HMAC check failed") before any lockout is seen. If so, a subsequent
+# lockout is attributed to this PIN, not treated as a leftover, and it is
+# not retried.
 set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
@@ -147,6 +164,83 @@ if grep -q "still in dictionary-attack lockout after an automatic clear attempt"
     pass "explains the TPM is still locked even after clearing"
 else
     fail "did not explain the still-locked state: $(cat "$TMPDIR/stderr")"
+fi
+
+echo "=== a genuinely WRONG PIN escalates into a lockout mid-call -- must NOT be reported as a leftover/unrelated lockout ==="
+cat > "$FAKEBIN/tpm2_nvread" <<'EOF'
+#!/bin/sh
+COUNT_FILE="$FAKE_CALL_COUNT_FILE"
+N=0
+[ -f "$COUNT_FILE" ] && N=$(cat "$COUNT_FILE")
+N=$((N + 1))
+echo "$N" > "$COUNT_FILE"
+if [ "$N" -le "${FAKE_WRONGPIN_COUNT:-0}" ]; then
+    echo "ERROR:esys:src/tss2-esys/api/Esys_NV_Read.c:105:Esys_NV_Read() Esys Finish ErrorCode (0x0000098e)" >&2
+    echo "ERROR: Esys_NV_Read(0x98E) - tpm:session(1):the authorization HMAC check failed and DA counter incremented" >&2
+else
+    echo "ERROR:esys:src/tss2-esys/api/Esys_NV_Read.c:105:Esys_NV_Read() Esys Finish ErrorCode (0x00000921)" >&2
+    echo "ERROR: Esys_NV_Read(0x921) - tpm:warn(2.0): authorizations for objects subject to DA protection are not allowed at this time because the TPM is in DA lockout mode" >&2
+fi
+exit 1
+EOF
+chmod +x "$FAKEBIN/tpm2_nvread"
+OUT=$(run_case FAKE_WRONGPIN_COUNT=2 FAKE_LOCKOUT_CLEAR_OK=1)
+CODE=$?
+case "$OUT" in
+    "") pass "fails cleanly (empty output) for a wrong PIN that trips a lockout" ;;
+    *) fail "expected empty output, got: $OUT" ;;
+esac
+CALLS=$(cat "$TMPDIR/callcount")
+if [ "$CALLS" -eq 3 ]; then
+    pass "stops within the normal 3-attempt budget (2 wrong-PIN failures, then the lockout they caused) instead of retrying"
+else
+    fail "expected exactly 3 attempts, got $CALLS"
+fi
+if [ "$(cat "$TMPDIR/lockout.log" 2>/dev/null | wc -l)" -eq 1 ]; then
+    pass "still clears the lockout it caused (leaves the TPM usable), but only once"
+else
+    fail "expected exactly one clear-lockout call, got: $(cat "$TMPDIR/lockout.log" 2>/dev/null)"
+fi
+if grep -q "this PIN is almost certainly wrong" "$TMPDIR/stderr"; then
+    pass "attributes the lockout to this PIN instead of calling it a leftover lockout"
+else
+    fail "did not attribute the lockout to the wrong PIN: $(cat "$TMPDIR/stderr")"
+fi
+if grep -q "has not yet failed" "$TMPDIR/stderr"; then
+    fail "used the 'leftover lockout, not this PIN' wording even though this PIN caused it: $(cat "$TMPDIR/stderr")"
+else
+    pass "does not use the leftover-lockout wording for a lockout this PIN actually caused"
+fi
+
+echo "=== a lockout with no prior wrong-PIN evidence from THIS call is still reported as a leftover (not attributed to this PIN) ==="
+cat > "$FAKEBIN/tpm2_nvread" <<'EOF'
+#!/bin/sh
+COUNT_FILE="$FAKE_CALL_COUNT_FILE"
+N=0
+[ -f "$COUNT_FILE" ] && N=$(cat "$COUNT_FILE")
+N=$((N + 1))
+echo "$N" > "$COUNT_FILE"
+if [ "$N" -le "${FAKE_LOCKOUT_FAIL_COUNT:-0}" ]; then
+    echo "ERROR:esys:src/tss2-esys/api/Esys_NV_Read.c:105:Esys_NV_Read() Esys Finish ErrorCode (0x00000921)" >&2
+    echo "ERROR: Esys_NV_Read(0x921) - tpm:warn(2.0): authorizations for objects subject to DA protection are not allowed at this time because the TPM is in DA lockout mode" >&2
+    exit 1
+fi
+OFFSET=0
+for ARG in "$@"; do
+    case "$ARG" in --offset=*) OFFSET="${ARG#--offset=}" ;; esac
+done
+if [ "$OFFSET" = "0" ]; then
+    printf '%b' "$FAKE_HDR_BYTES"
+else
+    printf '%s' "$FAKE_PAYLOAD"
+fi
+EOF
+chmod +x "$FAKEBIN/tpm2_nvread"
+run_case FAKE_LOCKOUT_FAIL_COUNT=1 FAKE_LOCKOUT_CLEAR_OK=1 FAKE_HDR_BYTES='\0245\01760005' FAKE_PAYLOAD="hello" >/dev/null 2>"$TMPDIR/stderr"
+if grep -q "this PIN is almost certainly wrong" "$TMPDIR/stderr"; then
+    fail "attributed a first-attempt lockout (no prior wrong-PIN evidence) to this PIN: $(cat "$TMPDIR/stderr")"
+else
+    pass "does not blame this PIN for a lockout that was already there before the first attempt"
 fi
 
 echo "=== no lockout at all -- must never call tpm2_dictionarylockout ==="

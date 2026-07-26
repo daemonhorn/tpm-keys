@@ -590,6 +590,20 @@ _tpm_read_secret() {
     # every session/transient object and say plainly what happened instead
     # of leaving the PIN looking wrong.
     NVERR=$(mktemp) || return 1
+    # Shared across both the header-peek and payload-read retry loops
+    # below (not reset between them): tracks whether THIS PIN itself has
+    # already shown a genuine wrong-PIN failure (0x98E, "the authorization
+    # HMAC check failed") earlier in this same call, before any lockout
+    # (0x921) is seen. A raw hardware TPM has one DA counter for the
+    # whole chip, not one per index, and the header-peek loop alone can
+    # retry the same wrong PIN up to 3 times -- enough by itself to trip
+    # MAX_AUTH_FAIL and turn a plain wrong PIN into a lockout mid-call.
+    # Without this, that looked identical to a pre-existing, unrelated
+    # lockout (e.g. a later read against a DIFFERENT index landing on an
+    # already-locked TPM) and printed a misleading "not a wrong PIN" note
+    # even when this PIN was, in fact, wrong -- confirmed directly: typing
+    # a deliberately wrong PIN produced exactly that message.
+    WRONG_PIN_SEEN=0
     ATTEMPT=0
     LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
@@ -601,10 +615,14 @@ _tpm_read_secret() {
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
         elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
-            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+            if [ "$WRONG_PIN_SEEN" = "1" ]; then
+                printf "%s\n" "[TPM] Error: repeated authorization failures with this PIN just triggered a TPM dictionary-attack lockout -- this PIN is almost certainly wrong, not a stale lockout. Clearing the lockout so the TPM stays usable, but not retrying with the same PIN." >&2
+                tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1
+                break
+            elif [ "$LOCKOUT_HANDLED" = "0" ]; then
                 LOCKOUT_HANDLED=1
                 if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
-                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                    printf "%s\n" "[TPM] Note: the TPM was already in dictionary-attack lockout before this attempt (this PIN has not yet failed) -- cleared automatically, retrying." >&2
                 else
                     printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
                     break
@@ -613,6 +631,8 @@ _tpm_read_secret() {
                 printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
                 break
             fi
+        elif grep -qE "0x98[Ee]|HMAC check failed" "$NVERR" 2>/dev/null; then
+            WRONG_PIN_SEEN=1
         fi
         OLD_IFS="$IFS"
         IFS=" $(printf '\t')"
@@ -668,10 +688,14 @@ _tpm_read_secret() {
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
         elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
-            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+            if [ "$WRONG_PIN_SEEN" = "1" ]; then
+                printf "%s\n" "[TPM] Error: repeated authorization failures with this PIN just triggered a TPM dictionary-attack lockout -- this PIN is almost certainly wrong, not a stale lockout. Clearing the lockout so the TPM stays usable, but not retrying with the same PIN." >&2
+                tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1
+                break
+            elif [ "$LOCKOUT_HANDLED" = "0" ]; then
                 LOCKOUT_HANDLED=1
                 if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
-                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                    printf "%s\n" "[TPM] Note: the TPM was already in dictionary-attack lockout before this attempt (this PIN has not yet failed) -- cleared automatically, retrying." >&2
                 else
                     printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
                     break
@@ -680,6 +704,8 @@ _tpm_read_secret() {
                 printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
                 break
             fi
+        elif grep -qE "0x98[Ee]|HMAC check failed" "$NVERR" 2>/dev/null; then
+            WRONG_PIN_SEEN=1
         fi
         [ -s "$TMPFILE" ] && break
     done
@@ -1205,6 +1231,20 @@ _tpm_read_secret() {
     # looks like a wrong PIN ("Invalid handle or authorization") but is
     # not; flushing frees them up, so retrying does nothing without it.
     NVERR=$(mktemp) || return 1
+    # Shared across both the header-peek and payload-read retry loops
+    # below (not reset between them): tracks whether THIS PIN itself has
+    # already shown a genuine wrong-PIN failure (0x98E, "the authorization
+    # HMAC check failed") earlier in this same call, before any lockout
+    # (0x921) is seen. A raw hardware TPM has one DA counter for the
+    # whole chip, not one per index, and the header-peek loop alone can
+    # retry the same wrong PIN up to 3 times -- enough by itself to trip
+    # MAX_AUTH_FAIL and turn a plain wrong PIN into a lockout mid-call.
+    # Without this, that looked identical to a pre-existing, unrelated
+    # lockout (e.g. a later read against a DIFFERENT index landing on an
+    # already-locked TPM) and printed a misleading "not a wrong PIN" note
+    # even when this PIN was, in fact, wrong -- confirmed directly: typing
+    # a deliberately wrong PIN produced exactly that message.
+    WRONG_PIN_SEEN=0
     ATTEMPT=0
     LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
@@ -1216,10 +1256,14 @@ _tpm_read_secret() {
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
         elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
-            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+            if [ "$WRONG_PIN_SEEN" = "1" ]; then
+                printf "%s\n" "[TPM] Error: repeated authorization failures with this PIN just triggered a TPM dictionary-attack lockout -- this PIN is almost certainly wrong, not a stale lockout. Clearing the lockout so the TPM stays usable, but not retrying with the same PIN." >&2
+                tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1
+                break
+            elif [ "$LOCKOUT_HANDLED" = "0" ]; then
                 LOCKOUT_HANDLED=1
                 if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
-                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                    printf "%s\n" "[TPM] Note: the TPM was already in dictionary-attack lockout before this attempt (this PIN has not yet failed) -- cleared automatically, retrying." >&2
                 else
                     printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
                     break
@@ -1228,6 +1272,8 @@ _tpm_read_secret() {
                 printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
                 break
             fi
+        elif grep -qE "0x98[Ee]|HMAC check failed" "$NVERR" 2>/dev/null; then
+            WRONG_PIN_SEEN=1
         fi
         OLD_IFS="$IFS"
         IFS=" $(printf '"'"'\t'"'"')"
@@ -1266,10 +1312,14 @@ _tpm_read_secret() {
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
         elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
-            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+            if [ "$WRONG_PIN_SEEN" = "1" ]; then
+                printf "%s\n" "[TPM] Error: repeated authorization failures with this PIN just triggered a TPM dictionary-attack lockout -- this PIN is almost certainly wrong, not a stale lockout. Clearing the lockout so the TPM stays usable, but not retrying with the same PIN." >&2
+                tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1
+                break
+            elif [ "$LOCKOUT_HANDLED" = "0" ]; then
                 LOCKOUT_HANDLED=1
                 if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
-                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                    printf "%s\n" "[TPM] Note: the TPM was already in dictionary-attack lockout before this attempt (this PIN has not yet failed) -- cleared automatically, retrying." >&2
                 else
                     printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
                     break
@@ -1278,6 +1328,8 @@ _tpm_read_secret() {
                 printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
                 break
             fi
+        elif grep -qE "0x98[Ee]|HMAC check failed" "$NVERR" 2>/dev/null; then
+            WRONG_PIN_SEEN=1
         fi
         [ -s "$TMPFILE" ] && break
     done
@@ -1476,6 +1528,20 @@ _tpm_read_secret() {
     # looks like a wrong PIN ("Invalid handle or authorization") but is
     # not; flushing frees them up, so retrying does nothing without it.
     NVERR=$(mktemp) || return 1
+    # Shared across both the header-peek and payload-read retry loops
+    # below (not reset between them): tracks whether THIS PIN itself has
+    # already shown a genuine wrong-PIN failure (0x98E, "the authorization
+    # HMAC check failed") earlier in this same call, before any lockout
+    # (0x921) is seen. A raw hardware TPM has one DA counter for the
+    # whole chip, not one per index, and the header-peek loop alone can
+    # retry the same wrong PIN up to 3 times -- enough by itself to trip
+    # MAX_AUTH_FAIL and turn a plain wrong PIN into a lockout mid-call.
+    # Without this, that looked identical to a pre-existing, unrelated
+    # lockout (e.g. a later read against a DIFFERENT index landing on an
+    # already-locked TPM) and printed a misleading "not a wrong PIN" note
+    # even when this PIN was, in fact, wrong -- confirmed directly: typing
+    # a deliberately wrong PIN produced exactly that message.
+    WRONG_PIN_SEEN=0
     ATTEMPT=0
     LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
@@ -1487,10 +1553,14 @@ _tpm_read_secret() {
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
         elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
-            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+            if [ "$WRONG_PIN_SEEN" = "1" ]; then
+                printf "%s\n" "[TPM] Error: repeated authorization failures with this PIN just triggered a TPM dictionary-attack lockout -- this PIN is almost certainly wrong, not a stale lockout. Clearing the lockout so the TPM stays usable, but not retrying with the same PIN." >&2
+                tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1
+                break
+            elif [ "$LOCKOUT_HANDLED" = "0" ]; then
                 LOCKOUT_HANDLED=1
                 if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
-                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                    printf "%s\n" "[TPM] Note: the TPM was already in dictionary-attack lockout before this attempt (this PIN has not yet failed) -- cleared automatically, retrying." >&2
                 else
                     printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
                     break
@@ -1499,6 +1569,8 @@ _tpm_read_secret() {
                 printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
                 break
             fi
+        elif grep -qE "0x98[Ee]|HMAC check failed" "$NVERR" 2>/dev/null; then
+            WRONG_PIN_SEEN=1
         fi
         OLD_IFS="$IFS"
         IFS=" $(printf '\t')"
@@ -1537,10 +1609,14 @@ _tpm_read_secret() {
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
         elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
-            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+            if [ "$WRONG_PIN_SEEN" = "1" ]; then
+                printf "%s\n" "[TPM] Error: repeated authorization failures with this PIN just triggered a TPM dictionary-attack lockout -- this PIN is almost certainly wrong, not a stale lockout. Clearing the lockout so the TPM stays usable, but not retrying with the same PIN." >&2
+                tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1
+                break
+            elif [ "$LOCKOUT_HANDLED" = "0" ]; then
                 LOCKOUT_HANDLED=1
                 if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
-                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                    printf "%s\n" "[TPM] Note: the TPM was already in dictionary-attack lockout before this attempt (this PIN has not yet failed) -- cleared automatically, retrying." >&2
                 else
                     printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
                     break
@@ -1549,6 +1625,8 @@ _tpm_read_secret() {
                 printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
                 break
             fi
+        elif grep -qE "0x98[Ee]|HMAC check failed" "$NVERR" 2>/dev/null; then
+            WRONG_PIN_SEEN=1
         fi
         [ -s "$TMPFILE" ] && break
     done
