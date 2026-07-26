@@ -591,6 +591,7 @@ _tpm_read_secret() {
     # of leaving the PIN looking wrong.
     NVERR=$(mktemp) || return 1
     ATTEMPT=0
+    LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s "$TPM_HDR_SIZE" --offset=0 "$IDX" 2>"$NVERR" | od -An -tu1)
@@ -599,6 +600,19 @@ _tpm_read_secret() {
             tpm2_flushcontext -t >/dev/null 2>&1
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
+        elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
+            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+                LOCKOUT_HANDLED=1
+                if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
+                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                else
+                    printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
+                    break
+                fi
+            else
+                printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
+                break
+            fi
         fi
         OLD_IFS="$IFS"
         IFS=" $(printf '\t')"
@@ -640,6 +654,7 @@ _tpm_read_secret() {
     # on, which is safe since every secret this script seeds is non-empty.
     TMPFILE=$(mktemp) || { rm -f "$NVERR"; return 1; }
     ATTEMPT=0
+    LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         if [ "$IS_HEADER" -eq 1 ]; then
@@ -652,6 +667,19 @@ _tpm_read_secret() {
             tpm2_flushcontext -t >/dev/null 2>&1
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
+        elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
+            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+                LOCKOUT_HANDLED=1
+                if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
+                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                else
+                    printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
+                    break
+                fi
+            else
+                printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
+                break
+            fi
         fi
         [ -s "$TMPFILE" ] && break
     done
@@ -1178,6 +1206,7 @@ _tpm_read_secret() {
     # not; flushing frees them up, so retrying does nothing without it.
     NVERR=$(mktemp) || return 1
     ATTEMPT=0
+    LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>"$NVERR" | od -An -tu1)
@@ -1186,6 +1215,19 @@ _tpm_read_secret() {
             tpm2_flushcontext -t >/dev/null 2>&1
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
+        elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
+            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+                LOCKOUT_HANDLED=1
+                if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
+                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                else
+                    printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
+                    break
+                fi
+            else
+                printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
+                break
+            fi
         fi
         OLD_IFS="$IFS"
         IFS=" $(printf '"'"'\t'"'"')"
@@ -1210,6 +1252,7 @@ _tpm_read_secret() {
     [ "$IS_HEADER" -eq 1 ] && HDR_LEN=$(( ($3 - 48) * 1000 + ($4 - 48) * 100 + ($5 - 48) * 10 + ($6 - 48) ))
     TMPFILE=$(mktemp) || { rm -f "$NVERR"; return 1; }
     ATTEMPT=0
+    LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         if [ "$IS_HEADER" -eq 1 ]; then
@@ -1222,6 +1265,19 @@ _tpm_read_secret() {
             tpm2_flushcontext -t >/dev/null 2>&1
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
+        elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
+            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+                LOCKOUT_HANDLED=1
+                if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
+                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                else
+                    printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
+                    break
+                fi
+            else
+                printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
+                break
+            fi
         fi
         [ -s "$TMPFILE" ] && break
     done
@@ -1421,6 +1477,7 @@ _tpm_read_secret() {
     # not; flushing frees them up, so retrying does nothing without it.
     NVERR=$(mktemp) || return 1
     ATTEMPT=0
+    LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>"$NVERR" | od -An -tu1)
@@ -1429,6 +1486,19 @@ _tpm_read_secret() {
             tpm2_flushcontext -t >/dev/null 2>&1
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
+        elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
+            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+                LOCKOUT_HANDLED=1
+                if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
+                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                else
+                    printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
+                    break
+                fi
+            else
+                printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
+                break
+            fi
         fi
         OLD_IFS="$IFS"
         IFS=" $(printf '\t')"
@@ -1453,6 +1523,7 @@ _tpm_read_secret() {
     [ "$IS_HEADER" -eq 1 ] && HDR_LEN=$(( ($3 - 48) * 1000 + ($4 - 48) * 100 + ($5 - 48) * 10 + ($6 - 48) ))
     TMPFILE=$(mktemp) || { rm -f "$NVERR"; return 1; }
     ATTEMPT=0
+    LOCKOUT_HANDLED=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         if [ "$IS_HEADER" -eq 1 ]; then
@@ -1465,6 +1536,19 @@ _tpm_read_secret() {
             tpm2_flushcontext -t >/dev/null 2>&1
             tpm2_flushcontext -s >/dev/null 2>&1
             tpm2_flushcontext -l >/dev/null 2>&1
+        elif grep -qE "0x921|lockout mode" "$NVERR" 2>/dev/null; then
+            if [ "$LOCKOUT_HANDLED" = "0" ]; then
+                LOCKOUT_HANDLED=1
+                if tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1; then
+                    printf "%s\n" "[TPM] Note: the TPM was in dictionary-attack lockout from prior failed attempts (not a wrong PIN) -- cleared automatically, retrying." >&2
+                else
+                    printf "%s\n" "[TPM] Error: the TPM is in dictionary-attack lockout and could not be cleared automatically (a lockout password may be set on this TPM) -- clear it manually with: tpm2_dictionarylockout --clear-lockout -- or wait for the lockout recovery interval, then retry." >&2
+                    break
+                fi
+            else
+                printf "%s\n" "[TPM] Error: the TPM is still in dictionary-attack lockout after an automatic clear attempt -- wait for the lockout recovery interval and retry." >&2
+                break
+            fi
         fi
         [ -s "$TMPFILE" ] && break
     done
