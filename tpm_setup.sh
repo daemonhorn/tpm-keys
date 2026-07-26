@@ -651,6 +651,22 @@ _tpm_read_secret() {
         # full-region read below: that path would misread the still-present
         # header bytes as leading payload garbage if this was just a
         # transient hiccup rather than genuinely headerless legacy data.
+        #
+        # Discriminate WHY, instead of returning silently: a caller piping
+        # this straight into ssh-add (the SSH-key load path) used to leave
+        # the user staring at ssh-add's own generic "error in libcrypto" --
+        # confirmed directly, typing a deliberately wrong PIN produced
+        # exactly that, with nothing saying it was the PIN.
+        if [ "$WRONG_PIN_SEEN" = "1" ]; then
+            printf "%s\n" "[TPM] Error: the TPM rejected the PIN for this secret (incorrect PIN)." >&2
+        else
+            LAST_ERR=$(tail -n 1 "$NVERR" 2>/dev/null)
+            if [ -n "$LAST_ERR" ]; then
+                printf "%s\n" "[TPM] Error: could not read this secret from the TPM: $LAST_ERR" >&2
+            else
+                printf "%s\n" "[TPM] Error: could not read this secret from the TPM (no response after 3 attempts)." >&2
+            fi
+        fi
         rm -f "$NVERR"
         return 1
     fi
@@ -1282,6 +1298,16 @@ _tpm_read_secret() {
         [ "$#" -ge 6 ] && break
     done
     if [ "$#" -lt 6 ]; then
+        if [ "$WRONG_PIN_SEEN" = "1" ]; then
+            printf "%s\n" "[TPM] Error: the TPM rejected the PIN for this secret (incorrect PIN)." >&2
+        else
+            LAST_ERR=$(tail -n 1 "$NVERR" 2>/dev/null)
+            if [ -n "$LAST_ERR" ]; then
+                printf "%s\n" "[TPM] Error: could not read this secret from the TPM: $LAST_ERR" >&2
+            else
+                printf "%s\n" "[TPM] Error: could not read this secret from the TPM (no response after 3 attempts)." >&2
+            fi
+        fi
         rm -f "$NVERR"
         return 1
     fi
@@ -1448,7 +1474,7 @@ unlock_tpm() {
         trap - INT TERM
 
         if [ "$NEEDS_SSH" -eq 1 ]; then
-            _tpm_read_secret '"$SSH_NV_INDEX"' "$USER_PIN" | ssh-add - || printf "%s\n" "[TPM] Error: Failed to load SSH key."
+            _tpm_read_secret '"$SSH_NV_INDEX"' "$USER_PIN" | ssh-add - 2>/dev/null || printf "%s\n" "[TPM] Error: Failed to load SSH key."
         fi
         if [ "$NEEDS_API" -eq 1 ]; then
             SKIP_API=0
@@ -1579,6 +1605,16 @@ _tpm_read_secret() {
         [ "$#" -ge 6 ] && break
     done
     if [ "$#" -lt 6 ]; then
+        if [ "$WRONG_PIN_SEEN" = "1" ]; then
+            printf "%s\n" "[TPM] Error: the TPM rejected the PIN for this secret (incorrect PIN)." >&2
+        else
+            LAST_ERR=$(tail -n 1 "$NVERR" 2>/dev/null)
+            if [ -n "$LAST_ERR" ]; then
+                printf "%s\n" "[TPM] Error: could not read this secret from the TPM: $LAST_ERR" >&2
+            else
+                printf "%s\n" "[TPM] Error: could not read this secret from the TPM (no response after 3 attempts)." >&2
+            fi
+        fi
         rm -f "$NVERR"
         return 1
     fi
@@ -1795,7 +1831,7 @@ if ( $needs_ssh == 1 || $needs_api == 1 ) then
         echo ""
 
         if ( $needs_ssh == 1 ) then
-            sh "$HOME/.tpm_unlock_helper.sh" ssh SSH_IDX "$USER_PIN" | ssh-add -
+            sh "$HOME/.tpm_unlock_helper.sh" ssh SSH_IDX "$USER_PIN" | sh -c "ssh-add - 2>/dev/null"
             if ( $status != 0 ) echo "[TPM] Error: Failed to load SSH key."
         endif
         if ( $needs_api == 1 ) then

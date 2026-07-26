@@ -38,8 +38,14 @@ if [ ! -s "$SNIPPET" ]; then
     exit 1
 fi
 
+# Mirrors what the real ssh-add prints (to stderr) when handed empty/bad
+# input -- e.g. from a TPM read that failed for a wrong PIN. unlock_tpm's
+# own read_secret already explains what actually went wrong (tested in
+# test_tpm_session_exhaustion.sh); this raw, generic parse error should no
+# longer reach the user alongside it.
 cat > "$FAKEBIN/ssh-add" <<'EOF'
 #!/bin/sh
+echo 'Error loading key "(stdin)": error in libcrypto' >&2
 exit 1
 EOF
 chmod +x "$FAKEBIN/ssh-add"
@@ -94,6 +100,10 @@ if grep -q "read_secret_called_for_API_INDEX" "$TMPDIR/calllog"; then
 else
     pass "never attempts a TPM read against the agent-mode API index when derivation fails"
 fi
+case "$OUT" in
+    *"error in libcrypto"*) fail "ssh-add's own generic parse-error noise leaked through instead of a clear explanation: $OUT" ;;
+    *) pass "does not leak ssh-add's raw, generic parse error to the user" ;;
+esac
 case "$OUT" in
     *"skipping the API key"*) pass "prints a clear explanation instead of a generic failure" ;;
     *) fail "did not explain why the API key was skipped: $OUT" ;;

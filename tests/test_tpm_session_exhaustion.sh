@@ -149,5 +149,34 @@ else
     pass "does not flush contexts for a genuinely wrong PIN / unrelated TPM error"
 fi
 
+# Regression for a real report on dhorn@freebsd-test: typing a deliberately
+# wrong PIN surfaced only ssh-add's own generic "error in libcrypto" (from
+# being handed empty input) and a bare "Failed to load SSH key.", with
+# nothing saying it was the PIN. _tpm_read_secret must now say so plainly
+# on its own stderr, discriminating this specific TPM return code (0x98E)
+# from any other reason a read might fail.
+if grep -q "incorrect PIN" "$TMPDIR/stderr"; then
+    pass "tells the user plainly that the PIN was rejected (not a silent/generic failure)"
+else
+    fail "did not explain that this was an incorrect PIN: $(cat "$TMPDIR/stderr")"
+fi
+
+echo "=== an unrecognized TPM failure (not session exhaustion, lockout, or a wrong PIN) still surfaces something, not silence ==="
+cat > "$FAKEBIN/tpm2_nvread" <<'EOF'
+#!/bin/sh
+echo "ERROR: Esys_TR_FromTPMPublic(0x18B) - tpm:handle(1):the handle is not correct for the use" >&2
+echo "ERROR: Unable to run tpm2_nvread" >&2
+exit 1
+EOF
+chmod +x "$FAKEBIN/tpm2_nvread"
+env PATH="$FAKEBIN:/bin:/usr/bin" sh -ec ". '$SNIPPET'; _tpm_read_secret 0x1502000 somepin" >/dev/null 2>"$TMPDIR/stderr"
+if grep -q "incorrect PIN" "$TMPDIR/stderr"; then
+    fail "misattributed an unrelated TPM error (bad/nonexistent index) to an incorrect PIN: $(cat "$TMPDIR/stderr")"
+elif grep -q "Unable to run tpm2_nvread" "$TMPDIR/stderr"; then
+    pass "surfaces the actual TPM error text instead of failing silently for an unrecognized error"
+else
+    fail "gave no usable diagnostic at all for an unrecognized TPM failure: $(cat "$TMPDIR/stderr")"
+fi
+
 printf "\n%s/%s tests passed\n" "$((TESTS_RUN - TESTS_FAILED))" "$TESTS_RUN"
 [ "$TESTS_FAILED" -eq 0 ]
