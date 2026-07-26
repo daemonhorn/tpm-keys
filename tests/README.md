@@ -78,6 +78,29 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   waiting to happen. Confirms both scripts now print a clear note in that
   case, and don't when the agent has nothing loaded, using fake
   `ssh-add`/`ssh-keygen` stubs against the real extracted code.
+- `test_ssh_agent_desktop_discovery.sh` -- regression test for a real bug
+  found debugging a live Debian 13/GNOME desktop: a plain SSH login does
+  not inherit the graphical session's `SSH_AUTH_SOCK` the way a new local
+  terminal spawned from the desktop does, even though the desktop
+  session's own agent (GNOME Keyring/gcr-ssh-agent/KDE Wallet) already has
+  the SSH identity loaded from an earlier `unlock_tpm` run -- so every
+  such SSH session re-prompted for the Master PIN forever instead of
+  reusing what was already unsealed. `_tpm_ensure_ssh_agent` now tries
+  `systemctl --user show-environment` first when `$SSH_AUTH_SOCK` is
+  completely unset, confirmed live against a real GNOME Keyring agent
+  (raw `ssh-add -`-loaded keys persist there across sessions, and
+  `ssh-keygen -Y sign` works once `SSH_AUTH_SOCK` points at it correctly)
+  before falling back to spawning a private agent. Covers: adopting a
+  real discovered socket, rejecting a discovered path that is not a real
+  socket, falling back cleanly when nothing is discoverable (FreeBSD/
+  headless), and never touching an already-set `SSH_AUTH_SOCK`. tcsh has
+  the identical fix in the generated `.tpm_unlock.csh`/`.cshrc` (verified
+  directly against real tcsh) -- along the way this also found and fixed
+  a real, independent bug in the *existing* tcsh `kill -0` liveness check:
+  `sh -c 'kill -0 "$1"' -- "$PID"` silently drops the positional argument
+  under tcsh (confirmed directly, even with a genuinely live PID), always
+  reporting the agent as dead; both now pass the value through an
+  exported env var instead.
 - `test_status.sh` / `.ps1` -- tests `--status`/`-Status`, the read-only
   summary of installed/locked/unlocked state, effective UID, `~/.ssh/id_ed25519`
   presence, environment secret count, and ssh-agent/loaded-identity state

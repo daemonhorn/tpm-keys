@@ -1243,6 +1243,28 @@ _tpm_needs_unlock() {
 # by unlock_tpm and the standalone shell-startup autostart hook below, so
 # both agree on what counts as "already running".
 _tpm_ensure_ssh_agent() {
+    if [ -z "$SSH_AUTH_SOCK" ]; then
+        # A shell that has not inherited ANY agent socket at all -- notably
+        # a plain SSH login to this machine, which does NOT get the
+        # environment of the desktop session (SSH_AUTH_SOCK, DISPLAY, ...)
+        # the way a new local terminal spawned from the desktop does. If
+        # the desktop session already unsealed the SSH key into its own
+        # systemd-user-managed agent (GNOME Keyring, gcr-ssh-agent, KDE
+        # Wallet), reuse that instead of spawning a private, throwaway
+        # agent that nothing else will ever see -- otherwise every such
+        # session re-prompts for the Master PIN forever even though the
+        # key is already unsealed elsewhere. The "|| _TPM_ENV_OUT=" fallback
+        # keeps this safe under set -e if systemctl is not installed
+        # (FreeBSD, no desktop session, ...) or there is no user session
+        # to query.
+        _TPM_ENV_OUT=$(systemctl --user show-environment 2>/dev/null) || _TPM_ENV_OUT=""
+        _TPM_DESKTOP_SOCK=$(printf '%s\n' "$_TPM_ENV_OUT" | sed -n 's/^SSH_AUTH_SOCK=//p')
+        if [ -n "$_TPM_DESKTOP_SOCK" ] && [ -S "$_TPM_DESKTOP_SOCK" ]; then
+            SSH_AUTH_SOCK="$_TPM_DESKTOP_SOCK"
+            export SSH_AUTH_SOCK
+        fi
+        unset _TPM_ENV_OUT _TPM_DESKTOP_SOCK
+    fi
     if [ -z "$SSH_AUTH_SOCK" ] || { [ -n "$SSH_AGENT_PID" ] && ! kill -0 "$SSH_AGENT_PID" 2>/dev/null; }; then
         eval "$(ssh-agent -s)" > /dev/null
     fi
@@ -1466,13 +1488,40 @@ set needs_api = 0
 # $SSH_AUTH_SOCK already points at a live agent (ours or a desktop keychain
 # agent that owns it before tcsh even starts), and only replaces it when
 # $SSH_AGENT_PID names a process of ours that has since died. tcsh's own
-# `kill` builtin is shelled out to via `sh` for consistent -0 semantics.
+# `kill` builtin is shelled out to via `sh` for consistent -0 semantics --
+# through an exported env var, NOT `sh -c '...' -- "$var"`: tcsh silently
+# drops extra positional args after a quoted -c script, so $1 in the child
+# sh script is always empty (confirmed directly: even a live PID reports
+# "not alive" through that pattern).
 set _tpm_start_agent = 0
 if (! $?SSH_AUTH_SOCK) then
-    set _tpm_start_agent = 1
+    # A fresh tcsh that has not inherited ANY agent socket at all --
+    # notably a plain SSH login to this machine, which does NOT get the
+    # environment of the desktop session (SSH_AUTH_SOCK, DISPLAY, ...) the
+    # way a new local terminal spawned from the desktop does. If the
+    # desktop session already unsealed the SSH key into its own
+    # systemd-user-managed agent (GNOME Keyring, gcr-ssh-agent, KDE
+    # Wallet), reuse that instead of spawning a private, throwaway agent
+    # that nothing else will ever see.
+    set _tpm_desktop_sock = `sh -c 'systemctl --user show-environment 2>/dev/null | sed -n "s/^SSH_AUTH_SOCK=//p"'`
+    if ("$_tpm_desktop_sock" != "") then
+        setenv _TPM_CANDIDATE_SOCK "$_tpm_desktop_sock"
+        sh -c 'test -S "$_TPM_CANDIDATE_SOCK"'
+        if ( $status == 0 ) then
+            setenv SSH_AUTH_SOCK "$_tpm_desktop_sock"
+        else
+            set _tpm_start_agent = 1
+        endif
+        unsetenv _TPM_CANDIDATE_SOCK
+    else
+        set _tpm_start_agent = 1
+    endif
+    unset _tpm_desktop_sock
 else if ($?SSH_AGENT_PID) then
-    sh -c 'kill -0 "$1" 2>/dev/null' -- "$SSH_AGENT_PID"
+    setenv _TPM_CANDIDATE_PID "$SSH_AGENT_PID"
+    sh -c 'kill -0 "$_TPM_CANDIDATE_PID" 2>/dev/null'
     if ( $status != 0 ) set _tpm_start_agent = 1
+    unsetenv _TPM_CANDIDATE_PID
 endif
 if ( $_tpm_start_agent == 1 ) eval `ssh-agent -c` > /dev/null
 unset _tpm_start_agent
@@ -1550,10 +1599,25 @@ if [ "$SSH_AGENT_AUTOSTART" = "yes" ]; then
 if ($?prompt) then
     set _tpm_start_agent = 0
     if (! $?SSH_AUTH_SOCK) then
-        set _tpm_start_agent = 1
+        set _tpm_desktop_sock = `sh -c '\''systemctl --user show-environment 2>/dev/null | sed -n "s/^SSH_AUTH_SOCK=//p"'\''`
+        if ("$_tpm_desktop_sock" != "") then
+            setenv _TPM_CANDIDATE_SOCK "$_tpm_desktop_sock"
+            sh -c '\''test -S "$_TPM_CANDIDATE_SOCK"'\''
+            if ( $status == 0 ) then
+                setenv SSH_AUTH_SOCK "$_tpm_desktop_sock"
+            else
+                set _tpm_start_agent = 1
+            endif
+            unsetenv _TPM_CANDIDATE_SOCK
+        else
+            set _tpm_start_agent = 1
+        endif
+        unset _tpm_desktop_sock
     else if ($?SSH_AGENT_PID) then
-        sh -c '\''kill -0 "$1" 2>/dev/null'\'' -- "$SSH_AGENT_PID"
+        setenv _TPM_CANDIDATE_PID "$SSH_AGENT_PID"
+        sh -c '\''kill -0 "$_TPM_CANDIDATE_PID" 2>/dev/null'\''
         if ( $status != 0 ) set _tpm_start_agent = 1
+        unsetenv _TPM_CANDIDATE_PID
     endif
     if ( $_tpm_start_agent == 1 ) eval `ssh-agent -c` > /dev/null
     unset _tpm_start_agent

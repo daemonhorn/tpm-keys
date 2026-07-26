@@ -208,6 +208,15 @@ Keyring, KDE Wallet, etc.) already owns it before the shell even starts,
 this is a no-op — and only starts a fresh `ssh-agent` if none is reachable
 or the one from an earlier shell has since died.
 
+If `SSH_AUTH_SOCK` is not set at all (a plain SSH login to a machine whose
+graphical session already has secrets unsealed does **not** inherit its
+environment the way a new local terminal does), this also tries
+`systemctl --user show-environment` before falling back to a private,
+throwaway agent — reusing the desktop's own already-unsealed agent instead
+of prompting for the Master PIN again in every such session. This needs
+`systemd --user` and is a no-op (falls straight back to the old behavior)
+without it, e.g. on FreeBSD or a headless box.
+
 ### API Key Unlock Optimization (SSH-agent-derived PIN)
 
 `ssh-agent` keeps your loaded SSH identity available across every new

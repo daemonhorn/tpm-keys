@@ -29,6 +29,7 @@ run_suite "FreeBSD sudo bootstrap" sh "$SCRIPT_DIR/test_freebsd_sudo_bootstrap.s
 run_suite "uninstall (sh)" sh "$SCRIPT_DIR/test_uninstall.sh"
 run_suite "--help usage text" sh "$SCRIPT_DIR/test_help.sh"
 run_suite "ssh-agent key check" sh "$SCRIPT_DIR/test_ssh_agent_key_check.sh"
+run_suite "ssh-agent desktop discovery" sh "$SCRIPT_DIR/test_ssh_agent_desktop_discovery.sh"
 run_suite "--status (sh)" sh "$SCRIPT_DIR/test_status.sh"
 
 if command -v pwsh >/dev/null 2>&1; then
