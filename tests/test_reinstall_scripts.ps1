@@ -125,6 +125,44 @@ try {
         Test-Fail "re-running Phase 5 damaged the user's own `$PROFILE content"
     }
 
+    # --- Edge case found on real hardware (dell-7550): a $PROFILE that
+    # already contains a TPM block whose closing marker has a DIFFERENT
+    # dash count than what this script version currently writes (observed
+    # in the wild from a much older script version whose block predates
+    # this repo's version tracking) must still be recognized and replaced
+    # on the next Phase 5 run, not left in place with a fresh block
+    # appended alongside it -- a literal-length-sensitive regex silently
+    # fails to match and duplicates instead of replacing.
+    $oldDashes = '-' * 45  # deliberately NOT the 46 this script currently writes
+    $legacyProfile = Join-Path $TMPDIR "legacy_dashes_profile.ps1"
+    $legacyProfileContent = @"
+# user's own profile stuff
+Set-Alias ll Get-ChildItem
+
+# --- TPM Secure Environment Setup (PowerShell) ---
+Get-Content 'C:\old\path\unlock_tpm.ps1' -Raw | Invoke-Expression
+# $oldDashes
+# SIG # Begin signature block
+# fake-signature-data-not-real
+# SIG # End signature block
+"@
+    Set-Content -Path $legacyProfile -Value $legacyProfileContent
+    $PROFILE = $legacyProfile
+    Invoke-TpmPhase5
+
+    $legacyContent = Get-Content -Path $legacyProfile -Raw
+    $legacyBlockCount = ([regex]::Matches($legacyContent, 'TPM Secure Environment Setup \(PowerShell\)')).Count
+    if ($legacyBlockCount -eq 1) {
+        Test-Pass "replaces an old-format block (different closing-marker dash count) instead of duplicating it"
+    } else {
+        Test-Fail "left $legacyBlockCount integration blocks after regenerating over an old-format block (dash-count mismatch) -- duplicated instead of replaced"
+    }
+    if ($legacyContent -match "user's own profile stuff" -and $legacyContent -match 'Set-Alias ll') {
+        Test-Pass "regenerating over an old-format block still leaves the user's own `$PROFILE content untouched"
+    } else {
+        Test-Fail "regenerating over an old-format block damaged the user's own `$PROFILE content"
+    }
+
     $env:HOME = $prevHomeEnv
 } finally {
     Remove-Item -Recurse -Force $TMPDIR -ErrorAction SilentlyContinue

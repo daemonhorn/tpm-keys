@@ -189,7 +189,35 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   embedded here-string with its own `function unlock_tpm { ... }` TEXT
   (written to a generated file, never executed here) whose closing brace
   would fool a naive "brace alone on its own line" extractor into truncating
-  the real function early.
+  the real function early. Also covers a real bug found live on Windows
+  hardware (dell-7550): the `$PROFILE` block's removal regex matched the
+  closing marker as a *literal* fixed-length dash string, so a block already
+  installed by an older script version (a different dash count) silently
+  failed to match and got left in place with a fresh block appended
+  alongside it instead of replacing it -- confirmed live by watching a
+  `-ReinstallScripts` run turn 2 duplicate blocks into 3. Fixed by matching
+  any run of dashes instead of a literal count; this test reproduces the
+  exact scenario (an old-format block with a different dash count, plus a
+  trailing Authenticode signature block) and checks exactly one block
+  survives regeneration.
+- `test_unlock_agent_match.ps1` -- regression test for a second real bug
+  found on the same live hardware: the generated `unlock_tpm` function's "is
+  the SSH key already loaded" check matched on key TYPE only (any ED25519
+  identity in the agent), not on the SPECIFIC key this install manages --
+  so a stale, unrelated ED25519 identity already loaded in ssh-agent (e.g.
+  left over from before the managed key was regenerated) was mistaken for
+  "already loaded," and the actual TPM-sealed key never got loaded at all.
+  Confirmed live: after regenerating the SSH key and reseeding the TPM,
+  `unlock_tpm` reported success but `ssh-add -l` was still showing the OLD
+  key's fingerprint. Fixed by comparing against the managed key's own
+  `.pub` content (falling back to the old "any ED25519" check only if no
+  `.pub` file exists). Runs the real generated `unlock_tpm` function
+  (extracted via AST from the file `Invoke-TpmPhase5` produces, the same
+  technique as `test_reinstall_scripts.ps1`) with
+  `Connect-Tpm2`/`Read-Tpm2Nv`/`Set-TpmSecretFromRaw`/`Get-Service`/
+  `ssh-add` mocked. Covers: a stale/unrelated key present (must still
+  attempt to load the managed key) and the managed key genuinely already
+  loaded alongside an already-loaded API secret (must do no redundant work).
 - `test_uid_breadcrumb.ps1` -- tests `Get-TpmUid` (PowerShell-only), the
   helper shared by `-Status`, `-Uninstall`, and the main setup flow's
   cross-OS UID prompt: once a UID is determined it's recorded in

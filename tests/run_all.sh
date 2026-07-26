@@ -43,6 +43,7 @@ if command -v pwsh >/dev/null 2>&1; then
     run_suite "-Status (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_status.ps1"
     run_suite "UID breadcrumb (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_uid_breadcrumb.ps1"
     run_suite "version tracking / -ReinstallScripts (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_reinstall_scripts.ps1"
+    run_suite "unlock_tpm agent-identity matching (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_unlock_agent_match.ps1"
 else
     printf "\n=== PowerShell tests ===\nSKIP: pwsh not installed\n"
 fi
