@@ -36,9 +36,23 @@ function Test-Fail { param([string]$Name) $script:TestsRun++; $script:TestsFaile
 # per test case; they're plain string substitutions, not regex, so no
 # escaping concerns there.
 $MockTemplate = @'
+$TpmSetupVersion = '__SCRIPTVERSION__'
 function Write-TpmLine { param([string]$Text) Write-Host $Text }
 function Read-Host { param($Prompt) return "__FAKEUID__" }
 function Get-TpmUid { return __FAKEUID__ }
+# Real (unmocked) implementations, matching tpm_setup.ps1 exactly -- pure
+# filesystem logic under the already-faked $HOME, nothing TPM/agent-related
+# to stub out.
+function Get-TpmKeysStateFile { return (Join-Path (Join-Path $HOME ".tpm_keys") "tpm_keys_state.txt") }
+function Read-TpmKeysState {
+    $stateFile = Get-TpmKeysStateFile
+    $state = @{ ApiAuthMode = 'master'; StrategyChoice = ''; ScriptVersion = '' }
+    if (-not (Test-Path $stateFile)) { return $state }
+    foreach ($line in (Get-Content -Path $stateFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^([A-Za-z]+)=(.*)$') { $state[$Matches[1]] = $Matches[2] }
+    }
+    return $state
+}
 function Connect-Tpm2 {
     if (__CONNECTTHROWS__) { throw "simulated TBS session failure" }
     return [IntPtr]::Zero
@@ -90,7 +104,8 @@ function Invoke-StatusBlock {
         [bool]$SshInstalled = $false,
         [int]$SshAddExit = 2,
         [bool]$AgentServiceRunning = $false,
-        [bool]$ConnectThrows = $false
+        [bool]$ConnectThrows = $false,
+        [string]$ScriptVersion = "9.9.9"
     )
     $mockScript = $MockTemplate.
         Replace('__FAKEUID__', $FakeUid).
@@ -98,7 +113,8 @@ function Invoke-StatusBlock {
         Replace('__SSHINSTALLED__', $(if ($SshInstalled) { '$true' } else { '$false' })).
         Replace('__SSHADDEXIT__', "$SshAddExit").
         Replace('__AGENTRUNNING__', $(if ($AgentServiceRunning) { '$true' } else { '$false' })).
-        Replace('__CONNECTTHROWS__', $(if ($ConnectThrows) { '$true' } else { '$false' }))
+        Replace('__CONNECTTHROWS__', $(if ($ConnectThrows) { '$true' } else { '$false' })).
+        Replace('__SCRIPTVERSION__', $ScriptVersion)
 
     # The real block ends with `exit 0`. Invoking it directly (`& $sb`) in
     # this process really does terminate the WHOLE test run the instant it
@@ -223,6 +239,75 @@ try {
         Test-Fail "wrongly reported 'not installed' when the TPM query itself failed"
     } else {
         Test-Pass "did not conflate a TPM query failure with 'not installed'"
+    }
+
+    # --- Case 7: nothing installed at all -- always reports the running
+    # script's version, but never hints at -ReinstallScripts (there's
+    # nothing to reinstall). ---
+    $home7 = Join-Path $TMPDIR "home7"
+    New-Item -ItemType Directory -Path $home7 | Out-Null
+    $out = Invoke-StatusBlock -FakeHome $home7 -ScriptVersion "9.9.9"
+    if ($out -match [regex]::Escape('Script version: 9.9.9')) {
+        Test-Pass "always reports the running script's version"
+    } else {
+        Test-Fail "did not report the running script's version: $out"
+    }
+    if ($out -match 'ReinstallScripts') {
+        Test-Fail "hinted at -ReinstallScripts with nothing installed: $out"
+    } else {
+        Test-Pass "does not hint at -ReinstallScripts when nothing is installed"
+    }
+
+    # --- Case 8: installed, but no tpm_keys_state.txt at all -- the genuine
+    # legacy scenario, since that file is brand new in this change: every
+    # PS1 install made before it shipped has secrets sealed with nothing on
+    # disk to record a version. Gating the hint on the state file's mere
+    # existence would silently miss this exact case, so this asserts the
+    # hint fires from $apiInstalled/$sshInstalled alone. ---
+    $home8 = Join-Path $TMPDIR "home8"
+    New-Item -ItemType Directory -Path $home8 | Out-Null
+    $out = Invoke-StatusBlock -FakeHome $home8 -ApiInstalled $true -SshInstalled $true -ScriptVersion "9.9.9"
+    if ($out -match 'Installed PowerShell integration: unknown version') {
+        Test-Pass "reports 'unknown version' for a genuine pre-versioning install (secrets sealed, no state file)"
+    } else {
+        Test-Fail "did not report unknown-version state: $out"
+    }
+    if ($out -match [regex]::Escape('-ReinstallScripts')) {
+        Test-Pass "hints at -ReinstallScripts for a genuine pre-versioning install"
+    } else {
+        Test-Fail "did not hint at -ReinstallScripts: $out"
+    }
+
+    # --- Case 9: installed, version matches -- no hint ---
+    $home9 = Join-Path $TMPDIR "home9"
+    New-Item -ItemType Directory -Path (Join-Path $home9 ".tpm_keys") -Force | Out-Null
+    Set-Content -Path (Join-Path $home9 ".tpm_keys\tpm_keys_state.txt") -Value @("ApiAuthMode=master", "StrategyChoice=1", "ScriptVersion=9.9.9")
+    $out = Invoke-StatusBlock -FakeHome $home9 -ApiInstalled $true -SshInstalled $true -ScriptVersion "9.9.9"
+    if ($out -match [regex]::Escape('Installed PowerShell integration: v9.9.9 (up to date)')) {
+        Test-Pass "reports up to date when versions match"
+    } else {
+        Test-Fail "did not report up-to-date correctly: $out"
+    }
+    if ($out -match 'ReinstallScripts') {
+        Test-Fail "hinted at -ReinstallScripts even though the version matches: $out"
+    } else {
+        Test-Pass "does not hint at -ReinstallScripts when the version matches"
+    }
+
+    # --- Case 10: installed, version stale -- hints at -ReinstallScripts ---
+    $home10 = Join-Path $TMPDIR "home10"
+    New-Item -ItemType Directory -Path (Join-Path $home10 ".tpm_keys") -Force | Out-Null
+    Set-Content -Path (Join-Path $home10 ".tpm_keys\tpm_keys_state.txt") -Value @("ApiAuthMode=master", "StrategyChoice=1", "ScriptVersion=0.0.1")
+    $out = Invoke-StatusBlock -FakeHome $home10 -ApiInstalled $true -SshInstalled $true -ScriptVersion "9.9.9"
+    if ($out -match [regex]::Escape('Installed PowerShell integration: v0.0.1 (this script is v9.9.9)')) {
+        Test-Pass "reports the stale installed version alongside the current one"
+    } else {
+        Test-Fail "did not report the version mismatch correctly: $out"
+    }
+    if ($out -match [regex]::Escape('-ReinstallScripts')) {
+        Test-Pass "hints at -ReinstallScripts for a stale install"
+    } else {
+        Test-Fail "did not hint at -ReinstallScripts: $out"
     }
 } finally {
     Remove-Item -Recurse -Force $TMPDIR -ErrorAction SilentlyContinue

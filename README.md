@@ -83,6 +83,7 @@ handled gracefully (see [Re-running the script](#re-running-the-script)).
 | `--env-file <path>`, `--env-file=<path>` | `-EnvFile <path>` | Seed from a dotenv-style file instead of the interactive prompt — see [Loading secrets from a file](#loading-secrets-from-a-file---env-file). |
 | `--uninstall` | `-Uninstall` | Remove this user's sealed secrets and shell/profile hooks, then exit — see [Uninstalling](#uninstalling). |
 | `--status` | `-Status` | Print a summary of the current state and exit — makes no changes — see [Checking status](#checking-status). |
+| `--reinstall-scripts` | `-ReinstallScripts` | Regenerate shell/profile integration only, without touching sealed secrets — see [Reinstalling shell integration](#reinstalling-shell-integration). |
 | `-h`, `--help` | `-h`, `-Help` | Print usage and exit. |
 
 An unrecognized flag, or `--env-file`/`-EnvFile` given no path, prints this
@@ -358,6 +359,13 @@ anything:
   than guessed).
 - Whether ssh-agent is running, and if so, the public key material of every
   loaded identity (via `ssh-add -L`) — never the private key.
+- The running script's version, and — if something is actually installed —
+  the version its shell integration was last generated with. When those
+  differ (or the installed version predates version tracking entirely),
+  `--status`/`-Status` prints a hint to run `--reinstall-scripts`/
+  `-ReinstallScripts` to bring it up to date without touching your sealed
+  secrets. A machine with nothing installed yet gets no such hint — there's
+  nothing to reinstall.
 
 A plain NV read needs no PIN and no admin rights, so `--status`/`-Status`
 runs without asking for your Master PIN and, on Windows, without triggering
@@ -376,10 +384,38 @@ Running `tpm_setup.sh` again is safe:
   bootstrap line in `~/.bash_profile`) are replaced in place, not
   duplicated.
 - Whether the API Key is sealed under the Master PIN or an SSH-agent-derived
-  PIN, and whether ssh-agent Autostart is enabled, are both remembered in
-  `~/.tpm_keys_state`, so re-running without re-seeding (keeping existing
-  data) regenerates the shell integration scripts with the same settings
-  instead of re-asking.
+  PIN, whether ssh-agent Autostart is enabled, and which Unlock Strategy you
+  chose are all remembered in `~/.tpm_keys_state`, so re-running without
+  re-seeding (keeping existing data) regenerates the shell integration
+  scripts with the same settings instead of re-asking.
+
+## Reinstalling shell integration
+
+```sh
+./tpm_setup.sh --reinstall-scripts
+```
+
+```powershell
+pwsh -File tpm_setup.ps1 -ReinstallScripts
+```
+
+Regenerates just the shell/profile integration (the `unlock_tpm` blocks in
+`~/.bashrc`/`~/.shrc`/`~/.cshrc`/`~/.bash_profile`, or the `$PROFILE` hook on
+Windows) using this script's current version, without asking for secrets,
+generating a new SSH key, or touching anything already sealed in the TPM.
+Use this after pulling a newer `tpm_setup.sh`/`tpm_setup.ps1` that fixes or
+improves the generated shell integration — `--status`/`-Status` tells you
+when your installed integration is older than the script and suggests this
+exact command.
+
+It needs an existing installation (`~/.tpm_keys_state` present) to read the
+settings — API auth mode, ssh-agent Autostart, Unlock Strategy — back from;
+run the script normally first if you haven't seeded a secret yet. On an
+install from before the Unlock Strategy was persisted, it asks that one
+question once and remembers the answer from then on; every install seeded
+after this feature shipped needs no prompts at all. On Windows this never
+triggers the admin-elevation relaunch, since regenerating `$PROFILE` needs no
+elevated TBS access.
 
 ## On-TPM format
 
@@ -446,7 +482,8 @@ wrong for that index serves no purpose and only spends down that budget.
 ## Testing
 
 `tests/` covers both scripts: the on-TPM header format, the `--env-file`
-parser, `--uninstall`, `--status`, and regressions for the tcsh alias,
+parser, `--uninstall`, `--status`, `--reinstall-scripts`/`-ReinstallScripts`
+and script-version tracking, and regressions for the tcsh alias,
 bash-login-shell, and FreeBSD `sudo`-bootstrap bugs described above. Run
 `./tests/run_all.sh`; see `tests/README.md` for what each suite covers and
 its prerequisites.

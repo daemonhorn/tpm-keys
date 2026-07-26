@@ -158,6 +158,38 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   take the whole test runner down with it (confirmed by reproducing that
   exact failure during development), and a job isolates `exit` to its own
   child process.
+- `test_reinstall_scripts.sh` -- tests script-version tracking and
+  `--reinstall-scripts`: `TPM_SETUP_VERSION` is persisted into
+  `~/.tpm_keys_state` as `SCRIPT_VERSION` at the end of every successful run,
+  and `--status` reports it, staying silent when nothing is installed,
+  reporting "up to date" when it matches, and hinting at the exact
+  `--reinstall-scripts` command to run when it's stale or missing entirely
+  (an install that predates this feature). `--reinstall-scripts` itself
+  re-runs only Phase 5 (shell/profile integration) -- errors cleanly with no
+  existing install, needs zero prompts when `STRATEGY_CHOICE` was already
+  persisted by a prior run (asking once and then persisting it for an older
+  install that predates that field), regenerates the shell integration
+  blocks without disturbing the user's own dotfile content, and prints a
+  distinct "Reinstall Complete" message instead of the fresh-install
+  SSH-key-backup reminder. Runs the real `tpm_setup.sh` end-to-end; the
+  reinstall cases deliberately have no `tpm2_nv*` stub on `PATH` at all, so a
+  stray TPM-seeding call would fail loudly ("command not found") instead of
+  silently succeeding -- proving the flag never touches sealed secrets.
+- `test_reinstall_scripts.ps1` -- the PowerShell-side counterpart:
+  `Invoke-TpmPhase5` (the extracted Phase 5 body shared by normal setup and
+  `-ReinstallScripts`) regenerates the `$PROFILE` integration block, and
+  running it twice in a row -- simulating a later `-ReinstallScripts` call --
+  must never duplicate that block or disturb the user's own `$PROFILE`
+  content. Also confirms `ApiAuthMode`/`StrategyChoice`/`ScriptVersion` are
+  persisted to `tpm_keys_state.txt` (the PowerShell equivalent of
+  `~/.tpm_keys_state`) after Phase 5 runs. Extracts the real function
+  definitions (`Get-TpmKeysStateFile`, `Read-TpmKeysState`,
+  `Write-TpmKeysState`, `Invoke-TpmPhase5`) using PowerShell's own AST parser
+  rather than a text/regex match, since `Invoke-TpmPhase5`'s body contains an
+  embedded here-string with its own `function unlock_tpm { ... }` TEXT
+  (written to a generated file, never executed here) whose closing brace
+  would fool a naive "brace alone on its own line" extractor into truncating
+  the real function early.
 - `test_uid_breadcrumb.ps1` -- tests `Get-TpmUid` (PowerShell-only), the
   helper shared by `-Status`, `-Uninstall`, and the main setup flow's
   cross-OS UID prompt: once a UID is determined it's recorded in
