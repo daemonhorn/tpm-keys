@@ -101,6 +101,41 @@ Or run a single suite directly, e.g. `sh tests/test_sentinel_header.sh` or
   under tcsh (confirmed directly, even with a genuinely live PID), always
   reporting the agent as dead; both now pass the value through an
   exported env var instead.
+- `test_tpm_session_exhaustion.sh` -- regression test for a real incident:
+  a raw hardware TPM (no resource manager) has only a handful of session
+  slots, and back-to-back `tpm2_nvread` calls (this project's own
+  extensive testing, or just several unlock attempts in a row) can
+  exhaust them (`TPM_RC_SESSION_MEMORY`, `0x903`), which surfaces as
+  "Invalid handle or authorization" -- indistinguishable from a wrong PIN
+  by exit status alone, and simply retrying the identical call (the
+  pre-existing retry loop) does nothing since nothing frees the exhausted
+  slots between attempts. `_tpm_read_secret` now detects this specific
+  error text, flushes all transient/session/loaded contexts, and tells
+  the user plainly what happened before retrying. Covers: recovering
+  after one exhaustion failure, not flushing unnecessarily on a clean
+  read, failing cleanly (not via a `set -e` abort) when exhaustion never
+  clears, and not mistaking a genuinely wrong PIN's unrelated error text
+  for session exhaustion. Uses a fake `tpm2_nvread`/`tpm2_flushcontext` on
+  an isolated `PATH` so it never touches a real TPM.
+- `test_agent_pin_no_wrong_attempt.sh` -- regression test for a real,
+  separate bug tripped over debugging the incident above: when
+  `API_AUTH_MODE=agent`, the API key's NV index is sealed with a PIN
+  *derived* from an SSH-agent signature, never the raw Master PIN. If the
+  SSH key fails to load for any reason, `_tpm_derive_api_pin` has no
+  agent identity to sign with, and `unlock_tpm` used to silently fall
+  back to trying the raw Master PIN against that index anyway -- a
+  guaranteed-wrong TPM authorization attempt that only increments the
+  dictionary-attack lockout counter for nothing (watched this happen
+  live: the counter climbed from 1 to 7 failed attempts purely from
+  repeated `unlock_tpm` invocations while debugging). `unlock_tpm` now
+  skips the API key entirely, with a clear message, rather than ever
+  submit a PIN it already knows is wrong. Covers: skipping and explaining
+  when derivation fails, using the derived PIN (not the Master PIN) when
+  it succeeds, and confirming Master-PIN mode is unaffected (no
+  regression). Exercises the real extracted `unlock_tpm` with its
+  dependencies (`_tpm_needs_unlock`, `_tpm_derive_api_pin`,
+  `_tpm_read_secret`, `_tpm_load_secret`, `ssh-add`) mocked, so it never
+  touches a real TPM or agent.
 - `test_status.sh` / `.ps1` -- tests `--status`/`-Status`, the read-only
   summary of installed/locked/unlocked state, effective UID, `~/.ssh/id_ed25519`
   presence, environment secret count, and ssh-agent/loaded-identity state

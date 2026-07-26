@@ -62,13 +62,16 @@ chmod +x "$FAKEBIN/ssh-agent"
 
 run_case() {
     : > "$TMPDIR/spawned.log"
-    # SSH_AUTH_SOCK="" first so this sandbox's own ambient agent socket
-    # (inherited otherwise, since `env` only sets/overrides listed names
-    # rather than clearing everything) never leaks into the "no
-    # SSH_AUTH_SOCK at all" cases -- a later same-named override in "$@"
-    # (the "already set" case) still wins, since env applies duplicate
-    # assignments left to right.
-    env SSH_AUTH_SOCK="" "$@" PATH="$FAKEBIN:/bin:/usr/bin" \
+    # SSH_AUTH_SOCK="" and SSH_AGENT_PID="" first so this sandbox's own
+    # ambient agent state (inherited otherwise, since `env` only
+    # sets/overrides listed names rather than clearing everything -- hit
+    # in practice: a stale SSH_AGENT_PID left exported in this very
+    # session from earlier, unrelated ssh-agent testing made the "agent
+    # died, respawn" branch fire regardless of what was discovered) never
+    # leaks into the "no SSH_AUTH_SOCK at all" cases -- a later same-named
+    # override in "$@" (the "already set" case) still wins, since env
+    # applies duplicate assignments left to right.
+    env SSH_AUTH_SOCK="" SSH_AGENT_PID="" "$@" PATH="$FAKEBIN:/bin:/usr/bin" \
         sh -ec ". '$SNIPPET'; _tpm_ensure_ssh_agent; printf 'SOCK=%s\n' \"\$SSH_AUTH_SOCK\"" 2>&1
 }
 

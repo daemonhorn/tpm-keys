@@ -30,6 +30,8 @@ run_suite "uninstall (sh)" sh "$SCRIPT_DIR/test_uninstall.sh"
 run_suite "--help usage text" sh "$SCRIPT_DIR/test_help.sh"
 run_suite "ssh-agent key check" sh "$SCRIPT_DIR/test_ssh_agent_key_check.sh"
 run_suite "ssh-agent desktop discovery" sh "$SCRIPT_DIR/test_ssh_agent_desktop_discovery.sh"
+run_suite "TPM session exhaustion recovery" sh "$SCRIPT_DIR/test_tpm_session_exhaustion.sh"
+run_suite "no wrong agent-PIN attempt" sh "$SCRIPT_DIR/test_agent_pin_no_wrong_attempt.sh"
 run_suite "--status (sh)" sh "$SCRIPT_DIR/test_status.sh"
 
 if command -v pwsh >/dev/null 2>&1; then

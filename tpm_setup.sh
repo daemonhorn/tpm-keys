@@ -578,10 +578,28 @@ _tpm_emit_header() {
 _tpm_read_secret() {
     IDX="$1"
     PIN="$2"
+    # A raw hardware TPM with no kernel/userspace resource manager has only
+    # a handful of session slots -- back-to-back tpm2_nvread calls (e.g.
+    # this session's own extensive testing, or just several unlock
+    # attempts in a row) can exhaust them (TPM_RC_SESSION_MEMORY, 0x903).
+    # That surfaces as "Invalid handle or authorization", indistinguishable
+    # from a wrong PIN by exit status alone, but retrying the exact same
+    # call does nothing -- the slots stay full until something is flushed.
+    # Captured to a temp file (not swallowed by 2>/dev/null) so it can be
+    # inspected for this specific, well-known error text; if found, flush
+    # every session/transient object and say plainly what happened instead
+    # of leaving the PIN looking wrong.
+    NVERR=$(mktemp) || return 1
     ATTEMPT=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
-        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s "$TPM_HDR_SIZE" --offset=0 "$IDX" 2>/dev/null | od -An -tu1)
+        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s "$TPM_HDR_SIZE" --offset=0 "$IDX" 2>"$NVERR" | od -An -tu1)
+        if grep -qE "0x903|session context" "$NVERR" 2>/dev/null; then
+            printf "%s\n" "[TPM] Note: the TPM ran out of session slots (a resource limit on the chip itself, not a wrong PIN) -- flushing stale sessions and retrying." >&2
+            tpm2_flushcontext -t >/dev/null 2>&1
+            tpm2_flushcontext -s >/dev/null 2>&1
+            tpm2_flushcontext -l >/dev/null 2>&1
+        fi
         OLD_IFS="$IFS"
         IFS=" $(printf '\t')"
         set -- $HDR
@@ -599,6 +617,7 @@ _tpm_read_secret() {
         # full-region read below: that path would misread the still-present
         # header bytes as leading payload garbage if this was just a
         # transient hiccup rather than genuinely headerless legacy data.
+        rm -f "$NVERR"
         return 1
     fi
     IS_HEADER=0
@@ -619,19 +638,25 @@ _tpm_read_secret() {
     # truncate; an empty result (rather than a specific expected length,
     # which the API-key case doesn't have on hand here) is what's retried
     # on, which is safe since every secret this script seeds is non-empty.
-    TMPFILE=$(mktemp) || return 1
+    TMPFILE=$(mktemp) || { rm -f "$NVERR"; return 1; }
     ATTEMPT=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         if [ "$IS_HEADER" -eq 1 ]; then
-            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset="$TPM_HDR_SIZE" "$IDX" 2>/dev/null > "$TMPFILE"
+            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset="$TPM_HDR_SIZE" "$IDX" 2>"$NVERR" > "$TMPFILE"
         else
-            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null | env LC_ALL=C tr -d '\0\377' > "$TMPFILE"
+            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>"$NVERR" | env LC_ALL=C tr -d '\0\377' > "$TMPFILE"
+        fi
+        if grep -qE "0x903|session context" "$NVERR" 2>/dev/null; then
+            printf "%s\n" "[TPM] Note: the TPM ran out of session slots (a resource limit on the chip itself, not a wrong PIN) -- flushing stale sessions and retrying." >&2
+            tpm2_flushcontext -t >/dev/null 2>&1
+            tpm2_flushcontext -s >/dev/null 2>&1
+            tpm2_flushcontext -l >/dev/null 2>&1
         fi
         [ -s "$TMPFILE" ] && break
     done
     cat "$TMPFILE"
-    rm -f "$TMPFILE"
+    rm -f "$TMPFILE" "$NVERR"
 }
 
 # Remembers which PIN sealed the API Key NV index ("master" or "agent" -- see
@@ -1147,10 +1172,21 @@ _tpm_derive_api_pin() {
 _tpm_read_secret() {
     IDX="$1"
     PIN="$2"
+    # A raw hardware TPM (no resource manager) has only a handful of
+    # session slots -- back-to-back reads can exhaust them (0x903), which
+    # looks like a wrong PIN ("Invalid handle or authorization") but is
+    # not; flushing frees them up, so retrying does nothing without it.
+    NVERR=$(mktemp) || return 1
     ATTEMPT=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
-        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>/dev/null | od -An -tu1)
+        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>"$NVERR" | od -An -tu1)
+        if grep -qE "0x903|session context" "$NVERR" 2>/dev/null; then
+            printf "%s\n" "[TPM] Note: the TPM ran out of session slots (a resource limit on the chip itself, not a wrong PIN) -- flushing stale sessions and retrying." >&2
+            tpm2_flushcontext -t >/dev/null 2>&1
+            tpm2_flushcontext -s >/dev/null 2>&1
+            tpm2_flushcontext -l >/dev/null 2>&1
+        fi
         OLD_IFS="$IFS"
         IFS=" $(printf '"'"'\t'"'"')"
         set -- $HDR
@@ -1158,6 +1194,7 @@ _tpm_read_secret() {
         [ "$#" -ge 6 ] && break
     done
     if [ "$#" -lt 6 ]; then
+        rm -f "$NVERR"
         return 1
     fi
     IS_HEADER=0
@@ -1171,19 +1208,25 @@ _tpm_read_secret() {
         done
     fi
     [ "$IS_HEADER" -eq 1 ] && HDR_LEN=$(( ($3 - 48) * 1000 + ($4 - 48) * 100 + ($5 - 48) * 10 + ($6 - 48) ))
-    TMPFILE=$(mktemp) || return 1
+    TMPFILE=$(mktemp) || { rm -f "$NVERR"; return 1; }
     ATTEMPT=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         if [ "$IS_HEADER" -eq 1 ]; then
-            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset=6 "$IDX" 2>/dev/null > "$TMPFILE"
+            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset=6 "$IDX" 2>"$NVERR" > "$TMPFILE"
         else
-            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null | env LC_ALL=C tr -d '"'"'\0\377'"'"' > "$TMPFILE"
+            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>"$NVERR" | env LC_ALL=C tr -d '"'"'\0\377'"'"' > "$TMPFILE"
+        fi
+        if grep -qE "0x903|session context" "$NVERR" 2>/dev/null; then
+            printf "%s\n" "[TPM] Note: the TPM ran out of session slots (a resource limit on the chip itself, not a wrong PIN) -- flushing stale sessions and retrying." >&2
+            tpm2_flushcontext -t >/dev/null 2>&1
+            tpm2_flushcontext -s >/dev/null 2>&1
+            tpm2_flushcontext -l >/dev/null 2>&1
         fi
         [ -s "$TMPFILE" ] && break
     done
     cat "$TMPFILE"
-    rm -f "$TMPFILE"
+    rm -f "$TMPFILE" "$NVERR"
 }
 
 _tpm_load_secret() {
@@ -1300,19 +1343,32 @@ unlock_tpm() {
             _tpm_read_secret '"$SSH_NV_INDEX"' "$USER_PIN" | ssh-add - || printf "%s\n" "[TPM] Error: Failed to load SSH key."
         fi
         if [ "$NEEDS_API" -eq 1 ]; then
-            API_PIN="$USER_PIN"
+            SKIP_API=0
             if [ "$TPM_API_AUTH_MODE" = "agent" ]; then
-                AGENT_PIN=$(_tpm_derive_api_pin "$TPM_SSH_PUB_PATH")
-                [ -n "$AGENT_PIN" ] && API_PIN="$AGENT_PIN"
-                unset AGENT_PIN
-            fi
-            RAW_SECRET=$(_tpm_read_secret '"$API_NV_INDEX"' "$API_PIN")
-            unset API_PIN
-            if [ -n "$RAW_SECRET" ]; then
-                _tpm_load_secret "$RAW_SECRET"
+                API_PIN=$(_tpm_derive_api_pin "$TPM_SSH_PUB_PATH")
+                if [ -z "$API_PIN" ]; then
+                    # NEVER fall back to the raw Master PIN here: this
+                    # index was sealed with an agent-derived PIN, not the
+                    # Master PIN, so that would be a guaranteed-wrong TPM
+                    # authorization attempt -- one that only burns a
+                    # dictionary-attack lockout counter for nothing (seen
+                    # directly: it climbed from 1 to 7 failed attempts
+                    # this way while debugging this exact scenario).
+                    SKIP_API=1
+                    printf "%s\n" "[TPM] Error: No SSH identity available to derive the agent-based PIN for the API key -- skipping the API key rather than risk a wrong TPM authorization attempt against it."
+                fi
             else
-                printf "%s\n" "[TPM] Error: Failed to load API secret."
+                API_PIN="$USER_PIN"
             fi
+            if [ "$SKIP_API" -eq 0 ]; then
+                RAW_SECRET=$(_tpm_read_secret '"$API_NV_INDEX"' "$API_PIN")
+                if [ -n "$RAW_SECRET" ]; then
+                    _tpm_load_secret "$RAW_SECRET"
+                else
+                    printf "%s\n" "[TPM] Error: Failed to load API secret."
+                fi
+            fi
+            unset API_PIN
         fi
     else
         printf "%s\n" "[TPM] All secure keys are already loaded."
@@ -1359,10 +1415,21 @@ PIN="$3"
 _tpm_read_secret() {
     IDX="$1"
     PIN="$2"
+    # A raw hardware TPM (no resource manager) has only a handful of
+    # session slots -- back-to-back reads can exhaust them (0x903), which
+    # looks like a wrong PIN ("Invalid handle or authorization") but is
+    # not; flushing frees them up, so retrying does nothing without it.
+    NVERR=$(mktemp) || return 1
     ATTEMPT=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
-        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>/dev/null | od -An -tu1)
+        HDR=$(tpm2_nvread -C "$IDX" -P "$PIN" -s 6 --offset=0 "$IDX" 2>"$NVERR" | od -An -tu1)
+        if grep -qE "0x903|session context" "$NVERR" 2>/dev/null; then
+            printf "%s\n" "[TPM] Note: the TPM ran out of session slots (a resource limit on the chip itself, not a wrong PIN) -- flushing stale sessions and retrying." >&2
+            tpm2_flushcontext -t >/dev/null 2>&1
+            tpm2_flushcontext -s >/dev/null 2>&1
+            tpm2_flushcontext -l >/dev/null 2>&1
+        fi
         OLD_IFS="$IFS"
         IFS=" $(printf '\t')"
         set -- $HDR
@@ -1370,6 +1437,7 @@ _tpm_read_secret() {
         [ "$#" -ge 6 ] && break
     done
     if [ "$#" -lt 6 ]; then
+        rm -f "$NVERR"
         return 1
     fi
     IS_HEADER=0
@@ -1383,19 +1451,25 @@ _tpm_read_secret() {
         done
     fi
     [ "$IS_HEADER" -eq 1 ] && HDR_LEN=$(( ($3 - 48) * 1000 + ($4 - 48) * 100 + ($5 - 48) * 10 + ($6 - 48) ))
-    TMPFILE=$(mktemp) || return 1
+    TMPFILE=$(mktemp) || { rm -f "$NVERR"; return 1; }
     ATTEMPT=0
     while [ "$ATTEMPT" -lt 3 ]; do
         ATTEMPT=$((ATTEMPT + 1))
         if [ "$IS_HEADER" -eq 1 ]; then
-            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset=6 "$IDX" 2>/dev/null > "$TMPFILE"
+            tpm2_nvread -C "$IDX" -P "$PIN" -s "$HDR_LEN" --offset=6 "$IDX" 2>"$NVERR" > "$TMPFILE"
         else
-            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>/dev/null | env LC_ALL=C tr -d '\0\377' > "$TMPFILE"
+            tpm2_nvread -C "$IDX" -P "$PIN" "$IDX" 2>"$NVERR" | env LC_ALL=C tr -d '\0\377' > "$TMPFILE"
+        fi
+        if grep -qE "0x903|session context" "$NVERR" 2>/dev/null; then
+            printf "%s\n" "[TPM] Note: the TPM ran out of session slots (a resource limit on the chip itself, not a wrong PIN) -- flushing stale sessions and retrying." >&2
+            tpm2_flushcontext -t >/dev/null 2>&1
+            tpm2_flushcontext -s >/dev/null 2>&1
+            tpm2_flushcontext -l >/dev/null 2>&1
         fi
         [ -s "$TMPFILE" ] && break
     done
     cat "$TMPFILE"
-    rm -f "$TMPFILE"
+    rm -f "$TMPFILE" "$NVERR"
 }
 
 case "$MODE" in
@@ -1563,22 +1637,34 @@ if ( $needs_ssh == 1 || $needs_api == 1 ) then
             if ( $status != 0 ) echo "[TPM] Error: Failed to load SSH key."
         endif
         if ( $needs_api == 1 ) then
-            set API_PIN = "$USER_PIN"
+            set _tpm_skip_api = 0
             if ( "AUTHMODE" == "agent" ) then
-                set AGENT_PIN = `sh "$HOME/.tpm_unlock_helper.sh" agentpin "PUBPATH"`
-                if ( "$AGENT_PIN" != "" ) set API_PIN = "$AGENT_PIN"
-                unset AGENT_PIN
-            endif
-            set TPM_ENV_FILE = `mktemp`
-            sh "$HOME/.tpm_unlock_helper.sh" api API_IDX "$API_PIN" > "$TPM_ENV_FILE"
-            if ( -s "$TPM_ENV_FILE" ) then
-                source "$TPM_ENV_FILE"
-                echo "[TPM] Secrets loaded."
+                set API_PIN = `sh "$HOME/.tpm_unlock_helper.sh" agentpin "PUBPATH"`
+                if ( "$API_PIN" == "" ) then
+                    # NEVER fall back to the raw Master PIN here: this
+                    # index was sealed with an agent-derived PIN, not the
+                    # Master PIN, so that would be a guaranteed-wrong TPM
+                    # authorization attempt -- one that only burns a
+                    # dictionary-attack lockout counter for nothing.
+                    set _tpm_skip_api = 1
+                    echo "[TPM] Error: No SSH identity available to derive the API key's agent-based PIN -- skipping the API key rather than risk a wrong TPM authorization attempt against it."
+                endif
             else
-                echo "[TPM] Error: Failed to load API secret."
+                set API_PIN = "$USER_PIN"
             endif
-            rm -f "$TPM_ENV_FILE"
+            if ( $_tpm_skip_api == 0 ) then
+                set TPM_ENV_FILE = `mktemp`
+                sh "$HOME/.tpm_unlock_helper.sh" api API_IDX "$API_PIN" > "$TPM_ENV_FILE"
+                if ( -s "$TPM_ENV_FILE" ) then
+                    source "$TPM_ENV_FILE"
+                    echo "[TPM] Secrets loaded."
+                else
+                    echo "[TPM] Error: Failed to load API secret."
+                endif
+                rm -f "$TPM_ENV_FILE"
+            endif
             unset API_PIN
+            unset _tpm_skip_api
         endif
     endif
     unset _tpm_api_loaded

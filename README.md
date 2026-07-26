@@ -395,6 +395,54 @@ header; unlocking falls back to a full-region read with trailing `0x00`/
 re-seeded. `tpm_setup.sh` and `tpm_setup.ps1` use the identical byte layout,
 so this doesn't affect dual-boot sharing.
 
+## Troubleshooting
+
+### "Failed to load SSH key" / "Failed to load API secret" with a correct PIN
+
+A raw hardware TPM with no kernel/userspace resource manager (common on a
+plain `/dev/tpm0`, without `/dev/tpmrm0` or `tpm2-abrmd`) has only a
+handful of session slots. Back-to-back `tpm2_nvread` calls — several
+unlock attempts in a row, or just a lot of TPM activity in a short window —
+can exhaust them (`TPM_RC_SESSION_MEMORY`, TPM error code `0x903`), which
+`tpm2-tools` reports as "out of memory for session contexts" followed by
+"Invalid handle or authorization". That looks exactly like a wrong PIN,
+but is not one, and simply retrying the identical call does not help,
+since nothing frees the exhausted slots between attempts.
+
+`unlock_tpm` now detects this specific error automatically, flushes all
+transient objects/sessions/loaded contexts, prints a note explaining what
+happened, and retries — no PIN re-entry needed. If you see:
+
+```
+[TPM] Note: the TPM ran out of session slots (a resource limit on the chip itself, not a wrong PIN) -- flushing stale sessions and retrying.
+```
+
+that's this recovery kicking in, not an error. If it keeps happening on
+every unlock, the TPM may be persistently constrained (heavy concurrent
+use, a firmware quirk) — `tpm2_flushcontext -t -s -l` by hand clears the
+same state if you need to before this script's own next attempt.
+
+### Avoiding unnecessary dictionary-attack lockout attempts
+
+When the API key was sealed with the SSH-agent-derived PIN (see
+[API Key Unlock Optimization](#api-key-unlock-optimization-ssh-agent-derived-pin)),
+its TPM NV index is **never** authorized with the Master PIN directly —
+only with a PIN derived from a live SSH-agent signature. If the SSH key
+fails to load for any reason (including the session-exhaustion case
+above, or a genuinely wrong PIN), there is no way to derive the correct
+PIN for the API index, and `unlock_tpm` now skips it outright with:
+
+```
+[TPM] Error: No SSH identity available to derive the agent-based PIN for the API key -- skipping the API key rather than risk a wrong TPM authorization attempt against it.
+```
+
+rather than ever guessing with the Master PIN. Every TPM NV index has a
+dictionary-attack lockout counter (`tpm2_getcap properties-variable | grep
+LOCKOUT_COUNTER` to check it) that increments on a failed authorization
+and only decays over time (`TPM2_PT_LOCKOUT_INTERVAL`, typically several
+minutes per attempt) — repeatedly submitting a PIN that is guaranteed
+wrong for that index serves no purpose and only spends down that budget.
+
 ## Testing
 
 `tests/` covers both scripts: the on-TPM header format, the `--env-file`
