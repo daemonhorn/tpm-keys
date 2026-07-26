@@ -36,7 +36,7 @@ if ($scriptText -match '(?s)if \(\$Uninstall\) \{(.*?)\n\}\n\n# 2\. ssh-agent se
     Test-Fail "could not extract the Uninstall block from tpm_setup.ps1 -- did it move/change shape?"
 }
 
-if ($scriptText -match "(?m)^\`$blockPattern = '(.+)'$") {
+if ($scriptText -match "(?m)^\s*\`$blockPattern = '(.+)'$") {
     $blockPattern = $Matches[1]
     $fakeProfile = @"
 # user's own stuff

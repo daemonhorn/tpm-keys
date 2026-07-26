@@ -34,6 +34,7 @@ run_suite "TPM session exhaustion recovery" sh "$SCRIPT_DIR/test_tpm_session_exh
 run_suite "no wrong agent-PIN attempt" sh "$SCRIPT_DIR/test_agent_pin_no_wrong_attempt.sh"
 run_suite "TPM dictionary-attack lockout recovery" sh "$SCRIPT_DIR/test_tpm_dictionary_lockout.sh"
 run_suite "--status (sh)" sh "$SCRIPT_DIR/test_status.sh"
+run_suite "version tracking / --reinstall-scripts" sh "$SCRIPT_DIR/test_reinstall_scripts.sh"
 
 if command -v pwsh >/dev/null 2>&1; then
     run_suite "sentinel header (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_sentinel_header.ps1"
@@ -41,6 +42,7 @@ if command -v pwsh >/dev/null 2>&1; then
     run_suite "uninstall (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_uninstall.ps1"
     run_suite "-Status (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_status.ps1"
     run_suite "UID breadcrumb (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_uid_breadcrumb.ps1"
+    run_suite "version tracking / -ReinstallScripts (PowerShell)" pwsh -NoProfile -File "$SCRIPT_DIR/test_reinstall_scripts.ps1"
 else
     printf "\n=== PowerShell tests ===\nSKIP: pwsh not installed\n"
 fi

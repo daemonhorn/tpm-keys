@@ -64,10 +64,10 @@ check_error_output() {
 }
 
 OUT=$(sh "$REPO_ROOT/tpm_setup.sh" --help 2>&1); CODE=$?
-check_output "tpm_setup.sh --help" "$OUT" "$CODE" "--env-file" "--uninstall" "TPM 2.0"
+check_output "tpm_setup.sh --help" "$OUT" "$CODE" "--env-file" "--uninstall" "--status" "--reinstall-scripts" "TPM 2.0"
 
 OUT=$(sh "$REPO_ROOT/tpm_setup.sh" -h 2>&1); CODE=$?
-check_output "tpm_setup.sh -h" "$OUT" "$CODE" "--env-file" "--uninstall" "TPM 2.0"
+check_output "tpm_setup.sh -h" "$OUT" "$CODE" "--env-file" "--uninstall" "--status" "--reinstall-scripts" "TPM 2.0"
 
 OUT=$(sh "$REPO_ROOT/tpm_setup.sh" --bogus-flag 2>&1); CODE=$?
 check_error_output "tpm_setup.sh --bogus-flag (unknown flag)" "$OUT" "$CODE" "--env-file" "--uninstall" "Unknown argument"
@@ -77,10 +77,10 @@ check_error_output "tpm_setup.sh --env-file (missing value)" "$OUT" "$CODE" "--e
 
 if command -v pwsh >/dev/null 2>&1; then
     OUT=$(pwsh -NoProfile -File "$REPO_ROOT/tpm_setup.ps1" -Help 2>&1); CODE=$?
-    check_output "tpm_setup.ps1 -Help" "$OUT" "$CODE" "-EnvFile" "-Uninstall" "TPM 2.0"
+    check_output "tpm_setup.ps1 -Help" "$OUT" "$CODE" "-EnvFile" "-Uninstall" "-Status" "-ReinstallScripts" "TPM 2.0"
 
     OUT=$(pwsh -NoProfile -File "$REPO_ROOT/tpm_setup.ps1" -h 2>&1); CODE=$?
-    check_output "tpm_setup.ps1 -h" "$OUT" "$CODE" "-EnvFile" "-Uninstall" "TPM 2.0"
+    check_output "tpm_setup.ps1 -h" "$OUT" "$CODE" "-EnvFile" "-Uninstall" "-Status" "-ReinstallScripts" "TPM 2.0"
 
     OUT=$(pwsh -NoProfile -File "$REPO_ROOT/tpm_setup.ps1" -BogusFlag 2>&1); CODE=$?
     check_error_output "tpm_setup.ps1 -BogusFlag (unknown flag)" "$OUT" "$CODE" "-EnvFile" "-Uninstall" "Unknown argument"
